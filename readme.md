@@ -1,3 +1,13 @@
+https://github.com/geewoong/sysprog_material 참고함
+
+통신시엔 리틀엔디안으로
+
+## 커널과 api
+
+커널단에선 단순히 데이터 센딩 및 crc만 담당하고,
+
+api에서 header나 패킷을 얼마나 나누는지 등을 진행한다.
+
 ### gpoi 통신 프로토콜 v1.0
 
 GPIO 통신 프로토콜 설계 명세서
