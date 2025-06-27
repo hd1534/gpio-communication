@@ -24,7 +24,7 @@
  #include <linux/slab.h>
  #include <linux/uaccess.h>
  #include <linux/delay.h>
- #include <linux/ktime.h> // ktime 사용
+ #include <linux/ktime.h>
  #include <linux/wait.h>
  #include <linux/spinlock.h>
  #include <linux/crc16.h>
@@ -47,11 +47,14 @@
  #define RX_BUFFER_SIZE 256
  #define CLOCK_DELAY_US 10000 // 기본 클럭 간격 (us)
  
- // ktime을 나노초(ns) 단위로 사용
- #define NORMAL_CLK_MAX_NS (CLOCK_DELAY_US * 1500LL)      // 1.5배까지는 일반 클럭으로 간주
- #define SLOW_CLK_MIN_NS   (CLOCK_DELAY_US * 2000LL)      // 2.0배부터는 느린 클럭(EOT)
- #define TIMEOUT_MIN_NS    (CLOCK_DELAY_US * 5000LL)      // 5.0배 이상은 타임아웃
+ // ktime을 마이크로초(us) 단위로 사용
+ #define NORMAL_CLK_MAX_US (CLOCK_DELAY_US * 15LL / 10)    // 1.5배까지는 일반 클럭으로 간주
+ #define SLOW_CLK_MIN_US   (CLOCK_DELAY_US * 2LL)          // 2.0배부터는 느린 클럭(EOT)
+ #define TIMEOUT_MIN_US    (CLOCK_DELAY_US * 5LL)          // 5.0배 이상은 타임아웃
  
+// 라즈베리 파이의 GPIO 컨트롤러(BCM2835)의 기본 번호. 커널 내부에서 GPIO를 식별할 때 사용.
+// `gpioinfo` 명령어로 실제 base를 확인해야 할 수 있음.
+#define GPIOCHIP_BASE 512
 
  
  // =================================================================
@@ -87,8 +90,7 @@ enum comm_state {
      int my_pin_idx; // READ_WRITE 모드일 때 할당된 데이터 핀 인덱스 (0-3), -1은 R/O
  
      // IRQ 번호
-     int ctrl_irq;
-     int data_irqs[NUM_DATA_PINS];
+     int irqs[NUM_DATA_PINS+1];  // 0번은 ctrl핀 irq
  
      // 상태 및 동기화
      enum comm_state state;
@@ -101,7 +103,7 @@ enum comm_state {
      atomic_t rx_bytes_done; // 수신 완료된 바이트 수
      atomic_t rx_bits_done;  // 현재 바이트 내 수신된 비트 수
      atomic_t data_ready;    // 수신 완료 플래그
-     ktime_t last_irq_time;  // 마지막 IRQ 시간 기록
+     ktime_t last_irq_time;  // 마지막 IRQ 시간 기록 (us 단위)
 
     struct timer_list timeout_timer;
  };
@@ -127,8 +129,8 @@ enum comm_state {
 
  static irqreturn_t ctrl_pin_irq_handler(int irq, void *dev_id);
  static irqreturn_t data_pin_irq_handler(int irq, void *dev_id);
- static void set_all_pins_direction(enum gpiod_flags dir);
- static void release_all_resources(void);
+ static void set_all_pins_direction(struct gpio_comm_dev *dev, enum gpiod_flags dir);
+ static void release_all_resources(struct gpio_comm_dev *dev);
  
 
  
@@ -183,28 +185,28 @@ enum comm_state {
  static irqreturn_t ctrl_pin_irq_handler(int irq, void *dev_id) {
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
      ktime_t now;
-     s64 delta_ns;
+     s64 delta_us;
      u8 received_bits;
  
      now = ktime_get();
-     delta_ns = ktime_to_ns(ktime_sub(now, dev->last_irq_time));
+     delta_us = ktime_us_delta(now, dev->last_irq_time);
      dev->last_irq_time = now;
  
      // 너무 빨리 들어온 IRQ는 노이즈로 간주하고 무시
-     if (delta_ns < (CLOCK_DELAY_US * 500LL)) return IRQ_HANDLED;
+     if (delta_us < (CLOCK_DELAY_US / 2)) return IRQ_HANDLED;
  
      // 타임아웃 감지
-     if (delta_ns > TIMEOUT_MIN_NS) {
+     if (delta_us > TIMEOUT_MIN_US) {
          pr_warn("[%s] RX Timeout detected.\n", DRIVER_NAME);
          atomic_set(&dev->data_ready, -ETIMEDOUT);
          wake_up_interruptible(&dev->wq);
          return IRQ_HANDLED;
      }
      
-     received_bits = read_4bits();
+     received_bits = read_4bits(dev);
  
      // EOT (느린 클럭 + 모든 데이터 핀 High) 감지
-     if (delta_ns > SLOW_CLK_MIN_NS) {
+     if (delta_us > SLOW_CLK_MIN_US) {
          if (received_bits == 0x0F) {
              pr_info("[%s] EOT detected.\n", DRIVER_NAME);
              atomic_set(&dev->data_ready, 1); // 성공적으로 수신 완료
@@ -238,14 +240,14 @@ enum comm_state {
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
  
      // 유휴 상태가 아니거나, 내 핀에서 발생한 IRQ는 무시
-     if (atomic_read(&dev->state) != 0 || irq == dev->irqs[dev->my_pin_idx + 1]) {
+     if (dev->state != COMM_STATE_IDLE || irq == dev->irqs[dev->my_pin_idx + 1]) {
          return IRQ_NONE;
      }
  
      pr_info("[%s] Bus request from another node detected. Switching to RX mode.\n", DRIVER_NAME);
  
      // 1. 버스를 사용 중(BUSY)으로 마킹
-     atomic_set(&dev->state, 1);
+     dev->state = COMM_STATE_RECEIVING;
      
      // 2. 내 데이터 핀을 입력으로 전환하여 버스 양보
      gpiod_direction_input(dev->data_pins[dev->my_pin_idx]);
@@ -257,7 +259,7 @@ enum comm_state {
      enable_irq(dev->irqs[0]);
 
      // disable data_pin_irqs
-     for (i = 0; i < NUM_DATA_PINS; i++) disable_irq(dev->irqs[i + 1]);
+     for (int i = 0; i < NUM_DATA_PINS; i++) disable_irq(dev->irqs[i + 1]);
  
      return IRQ_HANDLED;
  }
@@ -288,12 +290,19 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
      size_t total_len = count + 4; // 2(길이 헤더) + count(데이터) + 2(CRC) 바이트
  
      // 1. 버스 상태 확인
-     if (atomic_cmpxchg(&dev->state, 0, 1) != 0) return -EBUSY;
+     if (dev->state != COMM_STATE_IDLE) return -EBUSY;
  
      // 2. 전송 버퍼 할당 및 데이터 준비
      tx_buf = kmalloc(total_len, GFP_KERNEL);
-     if (!tx_buf) { atomic_set(&dev->state, 0); return -ENOMEM; }
-     if (copy_from_user(tx_buf + 2, buf, count)) { kfree(tx_buf); atomic_set(&dev->state, 0); return -EFAULT; }
+     if (!tx_buf) { 
+        dev->state = COMM_STATE_IDLE; 
+        return -ENOMEM; 
+    }
+     if (copy_from_user(tx_buf + 2, buf, count)) { 
+        kfree(tx_buf); 
+        dev->state = COMM_STATE_IDLE;
+         return -EFAULT; 
+        }
  
      tx_buf[0] = (u8)(total_len & 0xFF);
      tx_buf[1] = (u8)((total_len >> 8) & 0xFF);
@@ -311,23 +320,23 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
      msleep(10); // 다른 노드들이 반응할 시간
  
      // 5. 제어핀 예비 클럭킹 및 충돌 확인
-     set_all_pins_direction(GPIOD_OUT_LOW);
-     for (i = 0; i < 3; i++) toggle_ctrl_clock();
-     if (read_4bits() != 0) {
+     set_all_pins_direction(dev, GPIOD_OUT_LOW);
+     for (i = 0; i < 3; i++) toggle_ctrl_clock(dev);
+     if (read_4bits(dev) != 0) {
          pr_err("[%s] Bus collision detected! Aborting TX.\n", DRIVER_NAME);
          goto tx_abort;
      }
  
      // 6. 실제 데이터 전송
      for (i = 0; i < total_len; i++) {
-         write_4bits(tx_buf[i] >> 4);
-         toggle_ctrl_clock();
-         write_4bits(tx_buf[i] & 0x0F);
-         toggle_ctrl_clock();
+         write_4bits(tx_buf[i] >> 4, dev);
+         toggle_ctrl_clock(dev);
+         write_4bits(tx_buf[i] & 0x0F, dev);
+         toggle_ctrl_clock(dev);
      }
      
      // 7. EOT 신호 전송 (느린 클럭 + 데이터핀 모두 High)
-     write_4bits(0x0F);
+     write_4bits(0x0F, dev);
      gpiod_set_value(dev->ctrl_pin, 0);
      udelay(CLOCK_DELAY_US * 3);
      gpiod_set_value(dev->ctrl_pin, 1);
@@ -335,10 +344,10 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
  tx_abort:
      kfree(tx_buf);
      // 8. 버스 해제 및 상태 복원
-     set_all_pins_direction(GPIOD_IN);
+     set_all_pins_direction(dev, GPIOD_IN);
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1);
      for (i = 0; i < NUM_DATA_PINS; i++) enable_irq(dev->irqs[i + 1]);
-     atomic_set(&dev->state, 0);
+     dev->state = COMM_STATE_IDLE;
  
      return count;
  }
@@ -373,7 +382,7 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
      // 4. 버스 상태 복원 (수신 후)
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1);
      disable_irq(dev->irqs[0]);
-     atomic_set(&dev->state, 0);
+     dev->state = COMM_STATE_IDLE;
  
      return bytes_to_copy;
  }
@@ -408,7 +417,7 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
      if(dev->ctrl_pin) gpiod_put(dev->ctrl_pin);
      for (i = 0; i < NUM_DATA_PINS; i++) {
          if(dev->data_pins[i]) {
-            int bcm = gpiod_to_bcm(dev->data_pins[i]);
+            int bcm = desc_to_gpio(dev->data_pins[i]);
             gpiod_put(dev->data_pins[i]);
             used_gpio_bcm[bcm] = 0;
          }
@@ -421,7 +430,7 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
      kfree(dev);
  }
  
- static ssize_t export_store(struct class *class, struct class_attribute *attr, const char *buf, size_t count) {
+ static ssize_t export_store(const struct class *class, const struct class_attribute *attr, const char *buf, size_t count) {
     char name[MAX_NAME_LEN], mode_str[4];
     int pins[NUM_DATA_PINS + 1];
     struct gpio_comm_dev *new_dev;
@@ -452,8 +461,8 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
    }
 
    // 이미 초기화된 디바이스인지 확인
-   for (int i = 0; i < MAX_DEV; i++) {
-       if (gpio_comm_table[i] && strcmp(gpio_comm_table[i]->name, name) == 0) {
+   for (int i = 0; i < MAX_DEVICES; i++) {
+       if (g_dev_table[i] && strcmp(g_dev_table[i]->name, name) == 0) {
        pr_warn("[%s] Device %s already initialized.\n", DRIVER_NAME, name);
 
        return -EEXIST;
@@ -466,14 +475,13 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
     strcpy(new_dev->name, name);
     
     // 모드 설정
-    for (i = 0; mode_str[i]; i++) mode_str[i] = tolower(mode_str[i]);
     if (strcmp(mode_str, "rw") == 0) new_dev->mode = MODE_READ_WRITE;
     else if (strcmp(mode_str, "r") == 0) new_dev->mode = MODE_READ_ONLY;
     else { ret = -EINVAL; goto err_free_dev; }
 
     // gpio 할당
-    new_dev->ctrl_pin = gpiod_get(NULL, NULL, pins[0], GPIOD_ASIS);
-    for(i=0; i < NUM_DATA_PINS; i++) new_dev->data_pins[i] = gpiod_get(NULL, NULL, pins[i+1], GPIOD_ASIS);
+    new_dev->ctrl_pin = gpio_to_desc(GPIOCHIP_BASE + pins[0]);
+    for(i=0; i < NUM_DATA_PINS; i++) new_dev->data_pins[i] = gpio_to_desc(GPIOCHIP_BASE + pins[i+1]);
     set_all_pins_direction(new_dev, GPIOD_IN);
 
     // RW 모드인 경우, 비어있는 데이터 핀 할당
@@ -482,7 +490,7 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
             if (gpiod_get_value(new_dev->data_pins[i]) == 1) continue;
             
             pr_info("[%s] %s: Using data pin %d for transmission.\n", DRIVER_NAME, name, i);
-            new_dev->assigned_pin_idx = i;
+            new_dev->my_pin_idx = i;
 
             // TODO: 조금더 안전하게 일정기간 관찰하기?
             gpiod_direction_output(new_dev->data_pins[i], 1);
@@ -491,13 +499,12 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
         if (i == NUM_DATA_PINS) { ret = -EBUSY; goto err_free_dev; }
 
     } else {
-        new_dev->assigned_pin_idx = -1;
+        new_dev->my_pin_idx = -1;
     }
 
     // 4. character device 및 device 파일 생성
-    if (cdev_init(&new_dev->cdev, &gpio_comm_fops)) {
-        goto err_destroy_device;
-    }
+    cdev_init(&new_dev->cdev, &gpio_comm_fops);
+
     new_dev->cdev.owner = THIS_MODULE;
     new_dev->device = device_create(g_dev_class, NULL, MKDEV(g_major_num, dev_idx), NULL, new_dev->name);
     if (IS_ERR(new_dev->device)) {
@@ -519,7 +526,7 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
 
     spin_lock_init(&new_dev->lock);
     init_waitqueue_head(&new_dev->wq);
-    atomic_set(&new_dev->state, 0);
+    new_dev->state = COMM_STATE_IDLE;
     atomic_set(&new_dev->data_ready, 0);
 
     g_dev_table[dev_idx] = new_dev;
@@ -534,7 +541,7 @@ err_free_dev:
 }
  
 
- static ssize_t unexport_store(struct class *class, struct class_attribute *attr, const char *buf, size_t count) {
+ static ssize_t unexport_store(const struct class *class, const struct class_attribute *attr, const char *buf, size_t count) {
     char name[MAX_NAME_LEN];
     int i;
     struct gpio_comm_dev *dev = NULL;
@@ -568,30 +575,33 @@ static CLASS_ATTR_WO(unexport);
  // =================================================================
  
  static int __init gpio_comm_init(void) {
+    int ret;
+
      ret = alloc_chrdev_region(&g_major_num, 0, 1, DRIVER_NAME);
      if (ret) return ret;
 
      g_major_num = MAJOR(g_major_num);
      g_dev_class = class_create(CLASS_NAME);
 
-     class_create_file(g_class, &class_attr_export);
-     class_create_file(g_class, &class_attr_unexport);
+     class_create_file(g_dev_class, &class_attr_export);
+     class_create_file(g_dev_class, &class_attr_unexport);
      
      return 0;
  }
  
  static void __exit gpio_comm_exit(void) {
-     release_all_resources();
      for (int i = 0; i < MAX_DEVICES; i++) {
          if (g_dev_table[i]) {
+             release_all_resources(g_dev_table[i]);
+
              device_destroy(g_dev_class, MKDEV(g_major_num, i));
              kfree(g_dev_table[i]);
              g_dev_table[i] = NULL;
          }
      }
      
-     class_remove_file(g_class, &class_attr_export);
-     class_remove_file(g_class, &class_attr_unexport);  
+     class_remove_file(g_dev_class, &class_attr_export);
+     class_remove_file(g_dev_class, &class_attr_unexport);  
      class_destroy(g_dev_class);
 
      unregister_chrdev_region(MKDEV(g_major_num, 0), 1);
