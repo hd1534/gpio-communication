@@ -38,6 +38,8 @@
  #define CLASS_NAME "gpio_comm"
  #define DRIVER_NAME "gpio_comm_drv"
 
+ #define MAX_GPIO_BCM 30
+
  #define MAX_DEVICES 10
  #define MAX_NAME_LEN 20
  #define NUM_DATA_PINS 4
@@ -100,6 +102,8 @@ enum comm_state {
      atomic_t rx_bits_done;  // 현재 바이트 내 수신된 비트 수
      atomic_t data_ready;    // 수신 완료 플래그
      ktime_t last_irq_time;  // 마지막 IRQ 시간 기록
+
+    struct timer_list timeout_timer;
  };
  
 
@@ -418,14 +422,14 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
  }
  
  static ssize_t export_store(struct class *class, struct class_attribute *attr, const char *buf, size_t count) {
-    char name[MAX_NAME_LEN], mode_str[10];
+    char name[MAX_NAME_LEN], mode_str[4];
     int pins[NUM_DATA_PINS + 1];
-    struct gpio_comm_dev *new_dev = NULL;
+    struct gpio_comm_dev *new_dev;
     int i, dev_idx = -1, pin_idx = -1, ret;
 
     // 1. 입력 파싱: "name,mode,ctrl,d0,d1,d2,d3"
     // 입력 예시: echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
-    ret = sscanf(buf, "%19[^,],%9[^,],%d,%d,%d,%d,%d", 
+    ret = sscanf(buf, "%19[^,],%3[^,],%d,%d,%d,%d,%d", 
                  name, mode_str, &pins[0], &pins[1], &pins[2], &pins[3], &pins[4]);
     if (ret != 7) return -EINVAL;
 
@@ -439,16 +443,15 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
     if (dev_idx == -1) { return -ENOMEM; }
 
    // 이미 사용 중인 핀인지 확인
-   for (int i = 0; i <= NUMBER_OF_DATA_PINS; i++) {
-       if (used_gpio_bcm[bcm[i]]) {
-           pr_err("[%s] GPIO pin %d already in use.\n", DRIVER_NAME, bcm[i]);
+   for (int i = 0; i <= NUM_DATA_PINS; i++) {
+       if (used_gpio_bcm[pins[i]]) {
+           pr_err("[%s] GPIO pin %d already in use.\n", DRIVER_NAME, pins[i]);
 
            return -EEXIST;
        }
    }
 
    // 이미 초기화된 디바이스인지 확인
-
    for (int i = 0; i < MAX_DEV; i++) {
        if (gpio_comm_table[i] && strcmp(gpio_comm_table[i]->name, name) == 0) {
        pr_warn("[%s] Device %s already initialized.\n", DRIVER_NAME, name);
@@ -457,12 +460,10 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
        }
    }
 
-
     // 3. 새 디바이스 구조체 할당 및 초기화
     new_dev = kzalloc(sizeof(struct gpio_comm_dev), GFP_KERNEL);
     if (!new_dev) { return -ENOMEM; }
     strcpy(new_dev->name, name);
-    new_dev->bus = &g_bus;
     
     // 모드 설정
     for (i = 0; mode_str[i]; i++) mode_str[i] = tolower(mode_str[i]);
@@ -493,12 +494,19 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
         new_dev->assigned_pin_idx = -1;
     }
 
-    // 4. cdev 및 device 파일 생성
-    cdev_init(&new_dev->cdev, &gpio_comm_fops);
+    // 4. character device 및 device 파일 생성
+    if (cdev_init(&new_dev->cdev, &gpio_comm_fops)) {
+        goto err_destroy_device;
+    }
+    new_dev->cdev.owner = THIS_MODULE;
     new_dev->device = device_create(g_dev_class, NULL, MKDEV(g_major_num, dev_idx), NULL, new_dev->name);
-    if (IS_ERR(new_dev->device)) { ret = PTR_ERR(new_dev->device); goto err_free_dev; }
-    ret = cdev_add(&new_dev->cdev, new_dev->device->devt, 1);
-    if (ret) goto err_destroy_device;
+    if (IS_ERR(new_dev->device)) {
+        ret = PTR_ERR(new_dev->device); 
+        goto err_free_dev; 
+    }
+    if (cdev_add(&new_dev->cdev, new_dev->device->devt, 1)) {
+        goto err_destroy_device;
+    }
 
     // 5. 타이머 및 대기 큐 초기화
     timer_setup(&new_dev->timeout_timer, comm_timeout_callback, 0);
@@ -508,16 +516,6 @@ static int gpio_comm_release(struct inode *inode, struct file *filp) {
     new_dev->irqs[0] = gpiod_to_irq(new_dev->ctrl_pin);
     ret = request_irq(new_dev->irqs[0], ctrl_pin_irq_handler, IRQF_TRIGGER_RISING, "ctrl_pin", new_dev);
     disable_irq(new_dev->irqs[0]);
-       
-    if (new_dev->mode == MODE_READ_WRITE) {
-        gpiod_direction_output(new_dev->data_pins[pin_idx], 1); // 자신의 핀은 출력 High
-        for (i = 0; i < NUM_DATA_PINS; i++) {
-            if (i == pin_idx) continue;
-            ret = request_irq(g_bus.irqs[i+1], data_pin_irq_handler, IRQF_TRIGGER_RISING, name, new_dev);
-            // ... (에러 처리) ...
-        }
-    }
-
 
     spin_lock_init(&new_dev->lock);
     init_waitqueue_head(&new_dev->wq);
@@ -571,22 +569,31 @@ static CLASS_ATTR_WO(unexport);
  
  static int __init gpio_comm_init(void) {
      ret = alloc_chrdev_region(&g_major_num, 0, 1, DRIVER_NAME);
+     if (ret) return ret;
+
      g_major_num = MAJOR(g_major_num);
      g_dev_class = class_create(CLASS_NAME);
-     
-     g_dev->device = device_create(g_dev_class, NULL, MKDEV(g_major_num, 0), NULL, DEVICE_NAME);
-     device_create_file(g_dev->device, &dev_attr_control);
- 
-     cdev_init(&g_dev->cdev, &gpio_comm_fops);
-     cdev_add(&g_dev->cdev, MKDEV(g_major_num, 0), 1);
+
+     class_create_file(g_class, &class_attr_export);
+     class_create_file(g_class, &class_attr_unexport);
      
      return 0;
  }
  
  static void __exit gpio_comm_exit(void) {
      release_all_resources();
-     device_destroy(g_dev_class, MKDEV(g_major_num, 0));
+     for (int i = 0; i < MAX_DEVICES; i++) {
+         if (g_dev_table[i]) {
+             device_destroy(g_dev_class, MKDEV(g_major_num, i));
+             kfree(g_dev_table[i]);
+             g_dev_table[i] = NULL;
+         }
+     }
+     
+     class_remove_file(g_class, &class_attr_export);
+     class_remove_file(g_class, &class_attr_unexport);  
      class_destroy(g_dev_class);
+
      unregister_chrdev_region(MKDEV(g_major_num, 0), 1);
  }
  
