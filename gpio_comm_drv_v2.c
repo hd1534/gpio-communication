@@ -198,12 +198,18 @@
   * @note 데이터 니블 수신, EOT(End of Transmission) 감지 역할을 수행.
   */
  static irqreturn_t ctrl_pin_irq_handler(int irq, void *dev_id) {
+     if (!dev_id) {
+         pr_err("[%s] ERROR: ctrl_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME);
+         return IRQ_NONE;
+     }
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
      ktime_t now;
      s64 delta_us; // 이전 클럭과의 시간 차이 (us)
      u8 received_nibble;
      unsigned long flags;
      int current_byte_idx;
+     
+     pr_debug("[%s] ctrl_pin_irq_handler: dev=%p, state=%d\n", DRIVER_NAME, dev, dev->state);
  
      // 클럭이 감지되었으므로, 타임아웃 타이머를 리셋하여 시간을 연장.
      mod_timer(&dev->timeout_timer, jiffies + msecs_to_jiffies(50));
@@ -271,9 +277,16 @@
   * @note 다른 장치가 버스 사용을 요청(핀을 Low로 내림)하는 것을 감지.
   */
  static irqreturn_t data_pin_irq_handler(int irq, void *dev_id) {
+     if (!dev_id) {
+         pr_err("[%s] ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME);
+         return IRQ_NONE;
+     }
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
      unsigned long flags;
      int i;
+     
+     pr_debug("[%s] data_pin_irq_handler: irq=%d, dev=%p, state=%d\n", 
+              DRIVER_NAME, irq, dev, dev->state);
  
      spin_lock_irqsave(&dev->lock, flags);
  
@@ -321,10 +334,22 @@
  // =================================================================
  
  static int gpio_comm_open(struct inode *inode, struct file *filp) {
+     struct gpio_comm_dev *dev;
+     
+     if (!inode || !filp) {
+         pr_err("[%s] ERROR: gpio_comm_open: inode or filp is NULL\n", DRIVER_NAME);
+         return -EINVAL;
+     }
+     
      // container_of 매크로를 이용해 cdev 멤버 변수 주소로부터 부모 구조체(gpio_comm_dev)의 주소를 계산.
-     struct gpio_comm_dev *dev = container_of(inode->i_cdev, struct gpio_comm_dev, cdev);
+     dev = container_of(inode->i_cdev, struct gpio_comm_dev, cdev);
+     if (!dev) {
+         pr_err("[%s] ERROR: gpio_comm_open: Failed to get device from inode\n", DRIVER_NAME);
+         return -ENODEV;
+     }
+     
      filp->private_data = dev; // file 구조체에 디바이스 포인터를 저장하여 read/write 등에서 사용.
-     pr_info("[%s] Device '%s' opened.\n", DRIVER_NAME, dev->name);
+     pr_info("[%s] Device '%s' opened. Device ptr: %p\n", DRIVER_NAME, dev->name, dev);
      return 0;
  }
  
@@ -339,7 +364,18 @@
   * @note 프로토콜에 따라 데이터를 패킷으로 만들어 GPIO로 전송.
   */
  static ssize_t gpio_comm_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
+     if (!filp || !filp->private_data) {
+         pr_err("[%s] ERROR: gpio_comm_write: Invalid file pointer or private_data\n", DRIVER_NAME);
+         return -EBADF;
+     }
+     if (!buf) {
+         pr_err("[%s] ERROR: gpio_comm_write: NULL buffer pointer\n", DRIVER_NAME);
+         return -EFAULT;
+     }
+     
      struct gpio_comm_dev *dev = filp->private_data;
+     pr_debug("[%s] gpio_comm_write: dev=%p, count=%zu, mode=%d\n", 
+              DRIVER_NAME, dev, count, dev->mode);
      u8 *tx_buf = NULL;
      int i, ret = 0;
      u16 crc;
@@ -443,10 +479,22 @@
   * @note 완전한 패킷이 수신될 때까지 대기(block)하고, 수신 완료 시 유저 공간으로 복사.
   */
  static ssize_t gpio_comm_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
+     if (!filp || !filp->private_data) {
+         pr_err("[%s] ERROR: gpio_comm_read: Invalid file pointer or private_data\n", DRIVER_NAME);
+         return -EBADF;
+     }
+     if (!buf) {
+         pr_err("[%s] ERROR: gpio_comm_read: NULL buffer pointer\n", DRIVER_NAME);
+         return -EFAULT;
+     }
+     
      struct gpio_comm_dev *dev = filp->private_data;
      int ret, bytes_to_copy;
      u16 calc_crc, rx_crc;
      unsigned long flags;
+     
+     pr_debug("[%s] gpio_comm_read: dev=%p, len=%zu, state=%d\n", 
+              DRIVER_NAME, dev, len, dev->state);
  
      // 1. 데이터가 준비될 때까지 대기
      // 이미 처리할 데이터가 있는지 먼저 확인.
@@ -532,7 +580,12 @@
   */
  static void release_all_resources(struct gpio_comm_dev *dev) {
      int i;
-     if (!dev) return;
+     if (!dev) {
+         pr_err("[%s] ERROR: release_all_resources called with NULL device\n", DRIVER_NAME);
+         return;
+     }
+     pr_info("[%s] Releasing all resources for device %s (%p)\n", 
+             DRIVER_NAME, dev->name, dev);
  
      // 타이머, IRQ, GPIO, 디바이스, cdev, 메모리 순으로 할당의 역순으로 해제.
      del_timer_sync(&dev->timeout_timer);
@@ -569,6 +622,14 @@
      int pins[NUM_DATA_PINS + 1];
      struct gpio_comm_dev *new_dev = NULL;
      int i, dev_idx = -1, ret = 0;
+     
+     pr_info("[%s] export_store called, buf: %.*s\n", 
+             DRIVER_NAME, (int)min(count, (size_t)50), buf);
+             
+     if (!buf) {
+         pr_err("[%s] ERROR: export_store: NULL buffer\n", DRIVER_NAME);
+         return -EINVAL;
+     }
  
      // 전역 뮤텍스로 전체 함수를 보호하여, 여러 프로세스가 동시에 디바이스를 생성/삭제하는 것을 방지.
      mutex_lock(&g_dev_lock);
@@ -717,6 +778,13 @@
  
  
  static ssize_t unexport_store(const struct class *class, const struct class_attribute *attr, const char *buf, size_t count) {
+     pr_info("[%s] unexport_store called, buf: %.*s\n", 
+             DRIVER_NAME, (int)min(count, (size_t)50), buf);
+             
+     if (!buf) {
+         pr_err("[%s] ERROR: unexport_store: NULL buffer\n", DRIVER_NAME);
+         return -EINVAL;
+     }
      char name[MAX_NAME_LEN];
      int i;
      struct gpio_comm_dev *dev = NULL;
