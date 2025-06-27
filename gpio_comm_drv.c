@@ -1,548 +1,633 @@
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
-#include <linux/gpio/consumer.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/interrupt.h>
-#include <linux/device.h>
-#include <linux/workqueue.h>
-#include <linux/timer.h>
-
-
-// =================================================================
-// 1. 프로토콜 상수 정의
-// =================================================================
-#define DRIVER_NAME "gpio_comm"
-#define CLASS_NAME  "gpio_comm_class"
-
-// // 사용할 GPIO 핀 번호 (BCM 기준, 예시)
-// #define GPIO_PIN_D0 17 // 데이터 0
-// #define GPIO_PIN_D1 27 // 데이터 1
-// #define GPIO_PIN_D2 22 // 데이터 2
-// #define GPIO_PIN_S_CLK 23 // 슬레이브 클럭 (마스터의 입력)
-// #define GPIO_PIN_M_CLK 24 // 마스터 제어/클럭 (마스터의 출력)
-
-// 패킷 구조 관련
-#define PACKET_SIZE 128
-#define HEADER_SIZE 8
-#define CRC_SIZE 2
-#define PAYLOAD_SIZE (PACKET_SIZE - HEADER_SIZE - CRC_SIZE)
-
-#define BUFFER_SIZE 256
-
-#define DEFUALT_CLOCK_DELAY_US 1000 * 1000  // 약 1초
-
-
-
-// =================================================================
-// 2.enum 정의
-// =================================================================
-
-// 통신 모드를 나타내는 enum
-enum comm_mode {
-    COMM_MODE_MASTER,
-    COMM_MODE_SLAVE
-};
-
-// 통신 상태를 나타내는 enum
-enum comm_state {
-    COMM_LISTENING,
-    COMM_SENDING,
-    COMM_RECEIVING,
-    COMM_DONE
-};
-
-
-
-// =================================================================
-// 3. 구조체 정의
-// =================================================================
-
-// 디바이스 상태를 관리할 구조체
-struct gpio_comm_dev {
-    struct cdev cdev;
-    dev_t dev_num;
-    struct class *dev_class;
-
-    // GPIO 디스크립터
-    struct gpio_desc *d0, *d1, *d2; // 데이터 핀
-    struct gpio_desc *s_clk;    // 슬레이브 클럭 핀
-    struct gpio_desc *m_clk;    // 마스터 제어/클럭 핀
-
-    // IRQ 번호
-    int clk_irq;
-
-    // 통신 상태
-    enum comm_state state;
-    int clock_delay_us;
-    
-    // 데이터 수신을 위한 버퍼 및 카운터
-    char rx_buffer[BUFFER_SIZE];
-    char *rx_buffer_ptr;
-
-    // 유저 공간과의 동기화를 위한 대기 큐
-    wait_queue_head_t wq;
-
-    // 타임아웃 처리를 위한 커널 타이머
-    struct timer_list irq_timeout_timer;
-};
-
-static struct gpio_comm_dev *master_dev, *slave_dev;
-
-
-
-
-// =================================================================
-// 4. 하위 레벨 통신 함수 (실제 GPIO 제어)
-// =================================================================
-
-// 3-bit 데이터를 병렬로 setting하는 함수. slave -> master시 사용
-static void gpio_set_3bit(char data_bits) {
-    gpiod_set_value(slave_dev->d0, data_bits & 0x01);
-    gpiod_set_value(slave_dev->d1, (data_bits >> 1) & 0x01);
-    gpiod_set_value(slave_dev->d2, (data_bits >> 2) & 0x01);
-}
-
-// 4-bit 데이터를 병렬로 setting하는 함수. master -> slave시 사용
-static void gpio_set_4bit(char data_bits) {
-    gpiod_set_value(master_dev->d0, data_bits & 0x01);
-    gpiod_set_value(master_dev->d1, (data_bits >> 1) & 0x01);
-    gpiod_set_value(master_dev->d2, (data_bits >> 2) & 0x01);
-    gpiod_set_value(master_dev->s_clk, (data_bits >> 3) & 0x01);  // master는 slave의 clock을 data 선으로 사용한다.
-}
-
-// 3-bit 데이터를 병렬로 reading 하는 함수. slave -> master시 사용
-static char gpio_get_3bit(void) {
-    char data_bits = 0;
-    data_bits |= gpiod_get_value(slave_dev->d0);
-    data_bits |= gpiod_get_value(slave_dev->d1) << 1;
-    data_bits |= gpiod_get_value(slave_dev->d2) << 2;
-    return data_bits;
-}   
-
-// 4-bit 데이터를 병렬로 reading 하는 함수. master -> slave시 사용
-static char gpio_get_4bit(void) {
-    char data_bits = 0;
-    data_bits |= gpiod_get_value(master_dev->d0);
-    data_bits |= gpiod_get_value(master_dev->d1) << 1;
-    data_bits |= gpiod_get_value(master_dev->d2) << 2;
-    data_bits |= gpiod_get_value(master_dev->s_clk) << 3;
-    return data_bits;
-}
-
-// 1바이트를 전송하는 함수
-static int gpio_comm_send_byte(u8 byte, struct gpio_comm_dev *dev) {
-    if(dev->mode == COMM_MODE_MASTER) {  // 4bit식
-        // falling edge
-        gpiod_set_value(dev->m_clk, 0);
-        udelay(dev->clock_delay_us);
-
-        // send upper 4 bits
-        gpio_set_4bit(byte >> 4);
-
-        // rising edge
-        gpiod_set_value(dev->m_clk, 1);
-        udelay(dev->clock_delay_us);
-
-        // falling edge
-        gpiod_set_value(dev->m_clk, 0);
-        udelay(dev->clock_delay_us);
-
-        // send lower 4 bits
-        gpio_set_4bit(byte & 0b1111);
-
-        // rising edge
-        gpiod_set_value(dev->m_clk, 1);
-        udelay(dev->clock_delay_us);
-    } 
-    else {
-        // falling edge
-        gpiod_set_value(dev->s_clk, 0);
-        udelay(dev->clock_delay_us);
-
-        // send upper 3 bits
-        gpio_set_3bit(byte >> 5);
-
-        // rising edge
-        gpiod_set_value(dev->s_clk, 1);
-        udelay(dev->clock_delay_us);
-
-        // falling edge
-        gpiod_set_value(dev->s_clk, 0);
-        udelay(dev->clock_delay_us);
-
-        // send middle 3 bits
-        gpio_set_3bit((byte >> 2) & 0b0111);
-
-        // rising edge
-        gpiod_set_value(dev->s_clk, 1);
-        udelay(dev->clock_delay_us);
-
-        // falling edge
-        gpiod_set_value(dev->s_clk, 0);
-        udelay(dev->clock_delay_us);    
-
-        // send lower 2 bits
-        gpio_set_3bit(byte & 0b0011);
-
-        // rising edge
-        gpiod_set_value(dev->s_clk, 1);
-        udelay(dev->clock_delay_us);
-    }
-    return 0;
-}
-
-// 1바이트를 수신하는 함수
-// TODO: clock에 맞추어 irq로 되도록 수정해야함.
-static int gpio_comm_receive_byte(u8 *byte, struct gpio_comm_dev *dev) {
-    if(dev->mode == COMM_MODE_MASTER) {  // 4bit식
-        *byte = gpio_get_4bit() << 4 | gpio_get_4bit();
-    }        
-    else {
-        *byte = gpio_get_3bit() << 5 | gpio_get_3bit() << 2 | gpio_get_3bit();
-    }
-    return 0;
-}   
-
-
-
-// =================================================================
-// 5. Interrupt 핸들러
-// =================================================================
-
-
-// s_clk 하강 엣지 핸들러 (통신 시작용)
-static irqreturn_t comm_start_irq_handler(int irq, void *dev_id) {
-    struct gpio_comm_dev *dev = dev_id;
-    
-    if (dev->state != COMM_IDLE) return IRQ_NONE;
-
-    // 1. 상태를 RECEIVING으로 변경
-    dev->state = COMM_RECEIVING;
-    dev->bit_count = 0;
-    // memset(dev->rx_buffer, 0, sizeof(dev->rx_buffer)); // 버퍼 초기화
-
-    // 2. 이 IRQ(하강 엣지)는 비활성화하고, 상승 엣지 IRQ로 교체
-    // 중요: 핸들러 내에서는 _nosync 버전을 사용
-    disable_irq_nosync(irq); 
-
-    // comm_receive_data_irq_handler를 rising edge일때 호출하도록 추가
-
-    
-    // 이제 상승 엣지 IRQ를 기다리기 시작하므로, 타임아웃 타이머를 설정
-    // 예: 500ms 후 만료
-    mod_timer(&dev->irq_timeout_timer, jiffies + msecs_to_jiffies(500));
-    
-
-    pr_info("Communication Started.\n");
-
-    return IRQ_HANDLED;
-}
-
-// s_clk rising edge handler
-static irqreturn_t comm_receive_data_irq_handler(int irq, void *dev_id) {
-    struct gpio_comm_dev *dev = dev_id;
-
-    // *** 가장 중요한 부분 ***
-    // IRQ가 제시간에 도착했으므로 타임아웃 타이머를 삭제하여
-    // 콜백 함수가 실행되지 않도록 함.
-    // del_timer()는 타이머가 활성화되어 있지 않아도 안전하게 호출 가능.
-    del_timer(&dev->irq_timeout_timer);
-
-    
-    if (dev->state != COMM_RECEIVING) return IRQ_NONE;
-
-    // 1. 데이터를 수신하고 버퍼에 저장
-    // 2. bit_count를 증가
-    // 3. bit_count가 8이 되면 상태를 RECEIVING으로 변경
-    // 4. 이 IRQ(상승 엣지)는 비활성화하고, 하강 엣지 IRQ로 교체
-    // 중요: 핸들러 내에서는 _nosync 버전을 사용
-    disable_irq_nosync(irq); 
-    // irq_set_irq_type()으로 트리거 타입을 하강 엣지로 변경
-    irq_set_irq_type(irq, IRQ_TYPE_EDGE_FALLING);
-    // IRQ 다시 활성화
-    enable_irq(irq);
-
-    pr_info("Data Received: %c\n", dev->rx_buffer[dev->bit_count]);
-
-    // ... 기존의 데이터 읽기 및 처리 로직 ...
-    // if (통신이 완료되었다면) {
-    //     data_complete = 1;
-    // }
-
-    if (data_complete) {
-        // 통신이 성공적으로 끝났을 때의 처리
-        dev->state = COMM_DONE;
-        wake_up_interruptible(&dev->wq);
-    } else {
-        // 아직 데이터가 더 남았다면, 다음 IRQ를 위해 타이머를 다시 설정
-        mod_timer(&dev->irq_timeout_timer, jiffies + msecs_to_jiffies(500));
-    }
-
-    pr_info("Waiting for data IRQ, timeout set to 500ms\n");
-
-    return IRQ_HANDLED;
-}
-
-// 타이머 콜백 함수
-static void comm_timeout_callback(struct timer_list *t) {
-    // from_timer 매크로를 사용해 timer_list 구조체에서
-    // 부모 구조체(gpio_comm_dev)의 포인터를 얻어옴
-    struct gpio_comm_dev *dev = from_timer(dev, t, irq_timeout_timer);
-
-    pr_warn("IRQ Timeout! No response from the device.\n");
-
-    // 예외 처리 로직:
-    // 1. 상태를 IDLE로 되돌려놓음
-    dev->state = COMM_IDLE;
-    // 2. 혹시 모를 IRQ를 비활성화 (필요 시)
-    //    이 시점에 IRQ가 발생하면 꼬일 수 있으므로 락(lock) 사용이 권장됨 (아래 참조)
-    disable_irq(dev->s_clk_irq); 
-    
-    // 3. read()에서 대기 중인 프로세스가 있다면 에러를 반환하며 깨움
-    //    이 경우, read()는 -ETIMEDOUT 같은 에러를 반환하게 처리할 수 있음
-    dev->state = COMM_ERROR; // 예: 에러 상태 추가
-    wake_up_interruptible(&dev->wq);
-}
-
-
-// =================================================================
-// 6. file_operations 구현
-// =================================================================
-
-static int gpio_comm_open(struct inode *inode, struct file *filp) {
-    pr_info("[%s] device open\n", DRIVER_NAME);
-    
-    // TODO:
-    // 1. 모든 핀의 direction을 'in'으로 초기화
-    // 2. 모든 핀의 value가 low인걸 일정시간 확인. 아니면 error
-    // 3. Master 제어핀(m_clk)을 'out', 'high'로 설정
-
-
-    // TODO: 따로 함수로 빼는게 좋을듯?
-    // 4. 클럭 속도 보정(Handshake & Calibration) 로직 수행
-    //    - gpio_comm_send_byte, gpio_comm_wait_for_ack 등을 사용하여 구현
-    //    - 결정된 clock_delay_us를 my_dev->clock_delay_us에 저장
-    
-    return 0;
-}
-
-static ssize_t gpio_comm_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
-    char *k_buf;
-    size_t total_sent = 0;
-    
-    k_buf = kmalloc(count, GFP_KERNEL);
-    if (!k_buf) return -ENOMEM;
-    
-    if (copy_from_user(k_buf, buf, count)) {
-        kfree(k_buf);
-        return -EFAULT;
-    }
-    
-    pr_info("[%s] write %zu bytes\n", DRIVER_NAME, count);
-
-    // TODO:
-    //    a. 헤더 생성 (데이터의 크기)
-    //    b. 데이터와 CRC 추가
-    //    c. gpio_comm_send_byte 함수를 반복 호출하여 패킷 전송
-
-    
-    kfree(k_buf);
-    return total_sent; // 실제 전송된 바이트 수 반환
-}
-
-// read() 함수 예시
-static ssize_t comm_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
-    struct gpio_comm_dev *dev = filp->private_data;
-
-    // 데이터가 준비될 때까지 대기 (프로세스는 잠듦)
-    // wait_event_interruptible(대기큐, 조건);
-    // 조건: dev->state == COMM_DONE
-    if (wait_event_interruptible(dev->wq, dev->state == COMM_DONE)) {
-        return -ERESTARTSYS; // 시그널에 의해 중단됨
-    }
-    
-    // 데이터 복사...
-    // copy_to_user(...)
-
-    // 상태를 다시 IDLE로 변경하여 다음 통신 준비
-    dev->state = COMM_IDLE;
-    
-    return bytes_copied;
-}
-
-static int gpio_comm_release(struct inode *inode, struct file *filp) {
-    pr_info("[%s] device release\n", DRIVER_NAME);
-
-    // TODO:
-    return 0;
-}
-
-// file_operations 구조체 정의
-static const struct file_operations gpio_comm_fops = {
-    .owner = THIS_MODULE,
-    .open = gpio_comm_open,
-    .write = gpio_comm_write,
-    .read = gpio_comm_read,
-    .release = gpio_comm_release,
-};
-
-
-
-// =================================================================
-// 7. 모듈 초기화 및 종료
-// =================================================================
-
-
-// Forward declarations
-static int gpio_master_init_pins(int d0, int d1, int d2, int s_clk, int m_clk);
-static int gpio_slave_init_pins(int d0, int d1, int d2, int s_clk, int m_clk);
-
-// Sysfs `init` attribute handler
-static ssize_t init_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count) {
-    int d0, d1, d2, s_clk, m_clk;
-    int ret;
-
-    if (sscanf(buf, "%d, %d, %d, %d, %d", &d0, &d1, &d2, &s_clk, &m_clk) != 5) {
-        pr_err("[%s] Invalid arguments. Expected 5 pin numbers.\n", DRIVER_NAME);
-        return -EINVAL;
-    }
-
-    // Check if we are initializing master or slave
-    if (strcmp(dev_name(dev), "master") == 0) {
-        pr_info("[%s] Initializing Master with pins D0-2: %d,%d,%d; S_CLK: %d; M_CTRL: %d\n",
-                DRIVER_NAME, d0, d1, d2, s_clk, m_clk);
-        ret = gpio_master_init_pins(d0, d1, d2, s_clk, m_clk);
-    } else if (strcmp(dev_name(dev), "slave") == 0) {
-        pr_info("[%s] Initializing Slave with pins D0-2: %d,%d,%d; S_CLK: %d; M_CTRL: %d\n",
-                DRIVER_NAME, d0, d1, d2, s_clk, m_clk);
-        ret = gpio_slave_init_pins(d0, d1, d2, s_clk, m_clk);
-    } else {
-        pr_err("[%s] Unknown device trying to init: %s\n", DRIVER_NAME, dev_name(dev));
-        return -EINVAL;
-    }
-
-    if (ret) {
-        pr_err("[%s] Failed to initialize pins.\n", DRIVER_NAME);
-        return ret;
-    }
-
-    return count;
-}
-
-// TODO: Implement the full state machine, workqueues, timers, and IRQ handlers
-// The following are placeholders for the full logic described in the spec.
-int gpio_master_init_pins(int d0, int d1, int d2, int s_clk, int m_clk) {
-    // 1. gpiod_get for all 5 pins
-    // 2. Set directions: M_CTRL=OUT, others=IN
-    // 3. Set M_CTRL to HIGH
-    // 4. Setup IRQ for S_CLK to detect slave connection (rising edge)
-    // 5. In IRQ handler, start the handshake workqueue
-    pr_info("[%s] Master Initialized and waiting for slave.\n", DRIVER_NAME);
-    return 0;
-}
-
-int gpio_slave_init_pins(int d0, int d1, int d2, int s_clk, int m_clk) {
-    // 1. gpiod_get for all 5 pins
-    // 2. Set directions: M_CTRL=IN, others=OUT
-    // 3. Set S_CLK=HIGH, D0-2=LOW
-    // 4. Setup IRQ for M_CTRL to detect master's response
-    // 5. In IRQ handler, start the handshake workqueue
-    pr_info("[%s] Slave Initialized and signaling master.\n", DRIVER_NAME);
-    return 0;
-}
-
-// Create device attributes
-static DEVICE_ATTR(init, S_IWUSR, NULL, init_store);
-
-// Devices
-static struct device *master_dev;
-static struct device *slave_dev;
-static struct class *gpiocom_class;
-
-// file_operations for the character device
-// TODO: Implement read/write logic based on the state machine
-static ssize_t gpiocom_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
-    pr_info("gpiocom_read called\n");
-    // Use wait_queue to block until data is received from the other device
-    return 0;
-}
-
-static ssize_t gpiocom_write(struct file *filp, const char __user *buf, size_t len, loff_t *off) {
-    pr_info("gpiocom_write called\n");
-    // Packetize data and trigger the transmission state machine
-    return len;
-}
-
-static const struct file_operations gpiocom_fops = {
-    .owner = THIS_MODULE,
-    .read = gpiocom_read,
-    .write = gpiocom_write,
-};
-
-// Character device setup
-#define MAX_DEVICES 2
-static dev_t dev_num_base;
-static struct cdev gpiocom_cdev;
-
-static int __init gpiocom_driver_init(void) {
-    int ret;
-    pr_info("[%s] module loading\n", DRIVER_NAME);
-
-    // 1. Create class
-    gpiocom_class = class_create(DRIVER_NAME);
-    if (IS_ERR(gpiocom_class)) {
-        pr_err("Failed to create class\n");
-        return PTR_ERR(gpiocom_class);
+/**
+ * @file gpio_comm_drv.c
+ * @brief 5-wire 멀티-디바이스 P2P GPIO 통신 드라이버
+ * @author HJH (Original Concept), Gemini (Refactored & Implemented)
+ * @version 2.0
+ *
+ * @note
+ * - 이 드라이버는 최대 4개의 장치가 1개의 제어핀과 4개의 데이터핀을 공유하는
+ * P2P 통신 프로토콜을 구현합니다.
+ * - 사용법:
+ * 1. 드라이버 로드: insmod gpio_comm_drv.ko
+ * 2. 디바이스 생성 (sysfs):
+ * echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
+ * (이름, 모드(rw/r), 제어핀 bcm, 데이터핀1 bcm, 데이터핀2 bcm, 데이터핀3 bcm, 데이터핀4 bcm)
+ * 3. 생성된 디바이스 노드(/dev/my_dev1)를 통해 read/write 수행
+ */
+
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/fs.h>
+ #include <linux/cdev.h>
+ #include <linux/device.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/interrupt.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/delay.h>
+ #include <linux/timer.h>
+ #include <linux/wait.h>
+ #include <linux/spinlock.h>
+ #include <linux/crc16.h>
+ #include <linux/ctype.h>
+ 
+
+
+ // =================================================================
+ // 1. 상수 및 매크로 정의
+ // =================================================================
+ #define CLASS_NAME "gpio_comm"
+ #define DRIVER_NAME "gpio_comm_drv"
+ 
+ #define MAX_DEVICES 10
+ #define NUM_DATA_PINS 4
+ #define MAX_NAME_LEN 20
+ 
+ #define RX_BUFFER_SIZE 256
+
+ #define TIMEOUT_MS 500
+ #define BUS_CLEAR_TIMEOUT_MS 100
+ 
+
+
+ // =================================================================
+ // 2. Enum 및 구조체 정의
+ // =================================================================
+ 
+ // 디바이스 연결 모드
+ enum connect_mode {
+     MODE_READ_ONLY,
+     MODE_READ_WRITE,
+ };
+ 
+ // 공유 버스의 상태
+ enum bus_state {
+     BUS_IDLE,
+     BUS_REQUESTED, // 누군가 전송을 요청한 상태
+     BUS_ACTIVE,    // 실제 데이터 전송이 일어나는 상태
+ };
+ 
+ // 전역 버스 상태를 관리하는 구조체
+ struct gpio_comm_bus {
+     struct gpio_desc *ctrl_pin;
+     struct gpio_desc *data_pins[NUM_DATA_PINS];
+     int irqs[NUM_DATA_PINS + 1]; // 0: ctrl, 1-4: data
+ 
+     atomic_t state; // 버스 상태 (BUS_IDLE 등)
+     spinlock_t lock; // 구조체 보호를 위한 스핀락
+ 
+     // 어떤 디바이스가 어떤 데이터 핀을 점유했는지 추적
+     struct gpio_comm_dev *participants[NUM_DATA_PINS];
+     // 버스 사용을 요청한 디바이스
+     struct gpio_comm_dev *requester;
+ };
+ 
+ // 개별 디바이스를 나타내는 구조체
+ struct gpio_comm_dev {
+     char name[MAX_NAME_LEN];
+     struct cdev cdev;
+     struct device *device;
+     struct gpio_comm_bus *bus; // 공유 버스에 대한 포인터
+ 
+     enum connect_mode mode;
+     int assigned_pin_idx; // READ_WRITE 모드일 때 할당된 데이터 핀 인덱스 (0-3), -1은 R/O
+ 
+     u8 rx_buffer[RX_BUFFER_SIZE];
+     atomic_t rx_byte_count; // 수신된 바이트 수
+     atomic_t rx_bit_count;  // 현재 바이트 내 수신된 비트 수
+     atomic_t data_ready;    // 수신 완료 플래그
+ 
+     wait_queue_head_t wq; // read 대기를 위한 큐
+     struct timer_list timeout_timer;
+ };
+ 
+
+
+ // =================================================================
+ // 3. 전역 변수
+ // =================================================================
+ 
+ static struct gpio_comm_bus g_bus;
+ static struct gpio_comm_dev *g_dev_table[MAX_DEVICES];
+
+ static int g_major_num;
+ static struct class *g_dev_class;
+ 
+static int used_gpio_bcm[MAX_GPIO_BCM] = {0};
+
+
+
+ // =================================================================
+ // 4. 프로토타입 선언
+ // =================================================================
+ static irqreturn_t ctrl_pin_irq_handler(int irq, void *dev_id);
+ static irqreturn_t data_pin_irq_handler(int irq, void *dev_id);
+ 
+
+
+ // =================================================================
+ // 5. 하위 레벨 통신 함수
+ // =================================================================
+
+ static void set_data_pins_direction(enum gpiod_flags dir) {
+     int i;
+     for (i = 0; i < NUM_DATA_PINS; i++) {
+         if (g_bus.data_pins[i]) {
+             gpiod_direction_input(g_bus.data_pins[i]);
+         }
+     }
+ }
+ 
+ // 4-bit 데이터를 병렬로 전송
+ static void write_4bits(u8 data) {
+     gpiod_set_value(g_bus.data_pins[0], data & 0x01);
+     gpiod_set_value(g_bus.data_pins[1], (data >> 1) & 0x01);
+     gpiod_set_value(g_bus.data_pins[2], (data >> 2) & 0x01);
+     gpiod_set_value(g_bus.data_pins[3], (data >> 3) & 0x01);
+ }
+ 
+ // 4-bit 데이터를 병렬로 수신
+ static u8 read_4bits(void) {
+     u8 data = 0;
+     data |= gpiod_get_value(g_bus.data_pins[0]);
+     data |= gpiod_get_value(g_bus.data_pins[1]) << 1;
+     data |= gpiod_get_value(g_bus.data_pins[2]) << 2;
+     data |= gpiod_get_value(g_bus.data_pins[3]) << 3;
+     return data;
+ }
+ 
+ // 제어 핀 클럭 토글
+ static void toggle_ctrl_clock(int delay_us) {
+     gpiod_set_value(g_bus.ctrl_pin, 0);
+     udelay(delay_us);
+     gpiod_set_value(g_bus.ctrl_pin, 1);
+     udelay(delay_us);
+ }
+ 
+
+
+ // =================================================================
+ // 6. Interrupt 및 타이머 핸들러
+ // =================================================================
+ 
+ /**
+  * @brief 타이머 만료 시 호출 (수신 타임아웃 처리)
+  */
+ static void comm_timeout_callback(struct timer_list *t) {
+     struct gpio_comm_dev *dev = from_timer(dev, t, timeout_timer);
+
+     pr_warn("[%s] %s: Read timeout.\n", DRIVER_NAME, dev->name);
+     
+     atomic_set(&dev->data_ready, -ETIMEDOUT);
+     wake_up_interruptible(&dev->wq);
+ }
+ 
+ /**
+  * @brief 제어 핀 IRQ 핸들러 (데이터 수신)
+  */
+ static irqreturn_t ctrl_pin_irq_handler(int irq, void *dev_id) {
+     int i;
+     u8 received_bits;
+     u8 current_byte;
+     int byte_count;
+ 
+     // 버스가 활성 상태가 아니면 무시
+     if (atomic_read(&g_bus.state) != BUS_ACTIVE) return IRQ_NONE;
+     
+     // 데이터 핀에서 4-bit 읽기
+     received_bits = read_4bits();
+ 
+     // 모든 참여자에게 데이터 배포
+     for (i = 0; i < MAX_DEVICES; i++) {
+         struct gpio_comm_dev *dev = g_dev_table[i];
+         if (!dev) continue;
+         
+         // 타이머 리셋
+         del_timer(&dev->timeout_timer);
+         
+         byte_count = atomic_read(&dev->rx_byte_count);
+         current_byte = dev->rx_buffer[byte_count];
+ 
+         // 4-bit씩 2번에 걸쳐 1바이트 완성
+         if (atomic_read(&dev->rx_bit_count) == 0) { // 상위 4비트
+             current_byte = received_bits << 4;
+             atomic_inc(&dev->rx_bit_count);
+         } else { // 하위 4비트
+             current_byte |= received_bits;
+             atomic_set(&dev->rx_bit_count, 0);
+             byte_count = atomic_inc_return(&dev->rx_byte_count);
+         }
+         dev->rx_buffer[byte_count] = current_byte;
+ 
+         // 패킷 완료 조건 (예: 128바이트)
+         if (byte_count >= 128) {
+             atomic_set(&dev->data_ready, 1);
+             wake_up_interruptible(&dev->wq);
+         } else {
+             mod_timer(&dev->timeout_timer, jiffies + msecs_to_jiffies(TIMEOUT_MS));
+         }
+     }
+     return IRQ_HANDLED;
+ }
+ 
+ /**
+  * @brief 데이터 핀 IRQ 핸들러 (전송 요청 감지)
+  */
+ static irqreturn_t data_pin_irq_handler(int irq, void *dev_id) {
+     struct gpio_comm_dev *self = (struct gpio_comm_dev *)dev_id;
+     int i;
+ 
+     // 자신의 IRQ는 무시
+     if (self->assigned_pin_idx >= 0 && irq == g_bus.irqs[self->assigned_pin_idx + 1]) {
+         return IRQ_NONE;
+     }
+     
+     // 전송 요청이 아니면 무시
+     if (atomic_read(&g_bus.state) != BUS_IDLE) return IRQ_NONE;
+ 
+     pr_info("[%s] %s: Bus request detected from another device.\n", DRIVER_NAME, self->name);
+ 
+     // 자신의 데이터 핀을 입력으로 전환하여 버스를 비워줌
+     if (self->mode == MODE_READ_WRITE && self->assigned_pin_idx >= 0) {
+         gpiod_direction_input(g_bus.data_pins[self->assigned_pin_idx]);
+     }
+     
+     // 버스 상태를 REQUESTED로 변경 (최초 한 번만)
+     atomic_cmpxchg(&g_bus.state, BUS_IDLE, BUS_REQUESTED);
+ 
+     // 누가 요청했는지 찾기
+     for(i = 0; i < NUM_DATA_PINS; i++) {
+         if(irq == g_bus.irqs[i+1]) {
+             spin_lock(&g_bus.lock);
+             g_bus.requester = g_bus.participants[i];
+             spin_unlock(&g_bus.lock);
+             break;
+         }
+     }
+ 
+     return IRQ_HANDLED;
+ }
+ 
+ // =================================================================
+ // 7. file_operations 구현
+ // =================================================================
+ 
+ static int gpio_comm_open(struct inode *inode, struct file *filp) {
+     struct gpio_comm_dev *dev = container_of(inode->i_cdev, struct gpio_comm_dev, cdev);
+     filp->private_data = dev;
+     pr_info("[%s] Device '%s' opened.\n", DRIVER_NAME, dev->name);
+     return 0;
+ }
+ 
+ static int gpio_comm_release(struct inode *inode, struct file *filp) {
+     pr_info("[%s] Device released.\n", DRIVER_NAME);
+     return 0;
+ }
+ 
+ static ssize_t gpio_comm_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
+     struct gpio_comm_dev *dev = filp->private_data;
+     u8 tx_buf[128];
+     int i, ret;
+     unsigned long start_time;
+ 
+     if (dev->mode != MODE_READ_WRITE) return -EPERM;
+     if (count > 128) return -EINVAL;
+ 
+     // 1. 버스 소유권 획득 시도
+     spin_lock(&g_bus.lock);
+     if (atomic_read(&g_bus.state) != BUS_IDLE) {
+         spin_unlock(&g_bus.lock);
+         return -EBUSY;
+     }
+     atomic_set(&g_bus.state, BUS_REQUESTED);
+     g_bus.requester = dev;
+     spin_unlock(&g_bus.lock);
+ 
+     // 2. 자신의 핀을 클럭킹하여 버스 사용 요청
+     pr_info("[%s] %s: Requesting bus...\n", DRIVER_NAME, dev->name);
+     gpiod_set_value(g_bus.data_pins[dev->assigned_pin_idx], 0);
+     udelay(50);
+     gpiod_set_value(g_bus.data_pins[dev->assigned_pin_idx], 1);
+ 
+     // 3. 다른 모든 데이터 핀이 Low(입력 상태)가 될 때까지 대기
+     start_time = jiffies;
+     while (true) {
+         bool all_low = true;
+         for (i = 0; i < NUM_DATA_PINS; i++) {
+             if (i == dev->assigned_pin_idx) continue;
+             if (gpiod_get_value(g_bus.data_pins[i]) == 1) {
+                 all_low = false;
+                 break;
+             }
+         }
+         if (all_low) break;
+ 
+         if (time_is_after_jiffies(start_time + msecs_to_jiffies(BUS_CLEAR_TIMEOUT_MS))) {
+             pr_err("[%s] %s: Bus clear timeout!\n", DRIVER_NAME, dev->name);
+             atomic_set(&g_bus.state, BUS_IDLE);
+             return -ETIMEDOUT;
+         }
+         msleep(1);
+     }
+     
+     // 4. 버스를 점유하고 데이터 전송 준비
+     pr_info("[%s] %s: Bus acquired. Starting transmission.\n", DRIVER_NAME, dev->name);
+     atomic_set(&g_bus.state, BUS_ACTIVE);
+     set_data_pins_direction(GPIOD_OUT_LOW); // 모든 데이터 핀을 출력으로 전환
+ 
+     // 5. 제어 핀 3회 예비 클럭킹
+     for (i = 0; i < 3; i++) toggle_ctrl_clock(50);
+     
+     if (copy_from_user(tx_buf, buf, count)) return -EFAULT;
+     // (CRC 계산 및 추가 로직 필요)
+ 
+     // 6. 데이터 전송 (4-bit씩 2번에 1바이트)
+     for (i = 0; i < count; i++) {
+         write_4bits(tx_buf[i] >> 4); // 상위 4비트
+         toggle_ctrl_clock(100);
+         write_4bits(tx_buf[i] & 0x0F); // 하위 4비트
+         toggle_ctrl_clock(100);
+     }
+ 
+     // 7. 전송 완료 및 버스 해제
+     set_data_pins_direction(GPIOD_IN); // 모든 데이터 핀을 다시 입력으로
+     // 자신의 핀은 다시 출력 High로
+     gpiod_direction_output(g_bus.data_pins[dev->assigned_pin_idx], 1);
+     atomic_set(&g_bus.state, BUS_IDLE);
+ 
+     pr_info("[%s] %s: Transmission complete. Bus released.\n", DRIVER_NAME, dev->name);
+ 
+     return count;
+ }
+ 
+ static ssize_t gpio_comm_read(struct file *filp, char __user *buf, size_t len, loff_t *off) {
+     struct gpio_comm_dev *dev = filp->private_data;
+     int ret, bytes_read;
+ 
+     // 1. 수신 준비
+     atomic_set(&dev->data_ready, 0);
+     atomic_set(&dev->rx_byte_count, 0);
+     atomic_set(&dev->rx_bit_count, 0);
+     mod_timer(&dev->timeout_timer, jiffies + msecs_to_jiffies(5000)); // 5초 대기
+ 
+     // 2. 데이터가 준비될 때까지 대기
+     ret = wait_event_interruptible(dev->wq, atomic_read(&dev->data_ready) != 0);
+     del_timer_sync(&dev->timeout_timer); // 깨어나면 타이머 제거
+ 
+     if (ret < 0) return -ERESTARTSYS;
+     if (atomic_read(&dev->data_ready) < 0) return atomic_read(&dev->data_ready);
+ 
+     // 3. 데이터 복사
+     bytes_read = atomic_read(&dev->rx_byte_count);
+     if (len < bytes_read) bytes_read = len;
+     if (copy_to_user(buf, dev->rx_buffer, bytes_read)) return -EFAULT;
+ 
+     return bytes_read;
+ }
+ 
+ static const struct file_operations gpio_comm_fops = {
+     .owner = THIS_MODULE,
+     .open = gpio_comm_open,
+     .release = gpio_comm_release,
+     .read = gpio_comm_read,
+     .write = gpio_comm_write,
+ };
+ 
+ // =================================================================
+ // 8. Sysfs 및 모듈 초기화/종료
+ // =================================================================
+ 
+ static void cleanup_device(struct gpio_comm_dev *dev) {
+     if (!dev) return;
+ 
+     if (dev->assigned_pin_idx != -1) {
+         g_bus.participants[dev->assigned_pin_idx] = NULL;
+     }
+     
+     del_timer_sync(&dev->timeout_timer);
+     device_destroy(g_dev_class, dev->device->devt);
+     cdev_del(&dev->cdev);
+     kfree(dev);
+ }
+ 
+ static ssize_t export_store(struct class *class, struct class_attribute *attr, const char *buf, size_t count) {
+     char name[MAX_NAME_LEN], mode_str[10];
+     int pins[NUM_DATA_PINS + 1];
+     struct gpio_comm_dev *new_dev = NULL;
+     int i, dev_idx = -1, pin_idx = -1, ret;
+ 
+     // 1. 입력 파싱: "name,mode,ctrl,d0,d1,d2,d3"
+     // 입력 예시: echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
+     ret = sscanf(buf, "%19[^,],%9[^,],%d,%d,%d,%d,%d", 
+                  name, mode_str, &pins[0], &pins[1], &pins[2], &pins[3], &pins[4]);
+     if (ret != 7) return -EINVAL;
+ 
+     // 2. 유효성 검사 및 리소스 할당
+     for (i = 0; i < MAX_DEVICES; i++) {
+         if (!g_dev_table[i]) {
+             dev_idx = i;
+             break;
+         }
+     }
+     if (dev_idx == -1) { return -ENOMEM; }
+
+    // 이미 사용 중인 핀인지 확인
+    for (int i = 0; i <= NUMBER_OF_DATA_PINS; i++) {
+        if (used_gpio_bcm[bcm[i]]) {
+            pr_err("[%s] GPIO pin %d already in use.\n", DRIVER_NAME, bcm[i]);
+
+            return -EEXIST;
+        }
     }
 
-    // 2. Create master device and its 'init' file
-    master_dev = device_create(gpiocom_class, NULL, MKDEV(0, 0), NULL, "master");
-    if (IS_ERR(master_dev)) {
-        class_destroy(gpiocom_class);
-        return PTR_ERR(master_dev);
-    }
-    ret = device_create_file(master_dev, &dev_attr_init);
-    if (ret) {
-        device_destroy(gpiocom_class, MKDEV(0, 0));
-        class_destroy(gpiocom_class);
-        return ret;
+    // 이미 초기화된 디바이스인지 확인
+
+    for (int i = 0; i < MAX_DEV; i++) {
+        if (gpio_comm_table[i] && strcmp(gpio_comm_table[i]->name, name) == 0) {
+        pr_warn("[%s] Device %s already initialized.\n", DRIVER_NAME, name);
+
+        return -EEXIST;
+        }
     }
 
-    // 3. Create slave device and its 'init' file
-    slave_dev = device_create(gpiocom_class, NULL, MKDEV(0, 1), NULL, "slave");
-    // ... (error handling) ...
-    ret = device_create_file(slave_dev, &dev_attr_init);
-    // ... (error handling) ...
+ 
+     // 3. 새 디바이스 구조체 할당 및 초기화
+     new_dev = kzalloc(sizeof(struct gpio_comm_dev), GFP_KERNEL);
+     if (!new_dev) { return -ENOMEM; }
+     strcpy(new_dev->name, name);
+     new_dev->bus = &g_bus;
+     
+     // 모드 설정
+     for (i = 0; mode_str[i]; i++) mode_str[i] = tolower(mode_str[i]);
+     if (strcmp(mode_str, "rw") == 0) new_dev->mode = MODE_READ_WRITE;
+     else if (strcmp(mode_str, "r") == 0) new_dev->mode = MODE_READ_ONLY;
+     else { ret = -EINVAL; goto err_free_dev; }
 
-    // 4. Allocate and register character device for data I/O
-    ret = alloc_chrdev_region(&dev_num_base, 0, MAX_DEVICES, DRIVER_NAME);
-    // ... (error handling) ...
-    cdev_init(&gpiocom_cdev, &gpiocom_fops);
-    ret = cdev_add(&gpiocom_cdev, dev_num_base, MAX_DEVICES);
-    // ... (error handling) ...
+     // gpio 할당
+     new_dev->ctrl_pin = gpiod_get(NULL, NULL, pins[0], GPIOD_ASIS);
+     for(i=0; i < NUM_DATA_PINS; i++) new_dev->data_pins[i] = gpiod_get(NULL, NULL, pins[i+1], GPIOD_ASIS);
+     set_all_pins_direction(new_dev, GPIOD_IN);
+ 
+     // RW 모드인 경우, 비어있는 데이터 핀 할당
+     if (new_dev->mode == MODE_READ_WRITE) {
+         for(i = 0; i < NUM_DATA_PINS; i++) {
+             if (gpiod_get_value(new_dev->data_pins[i]) == 1) continue;
+             
+             pr_info("[%s] %s: Using data pin %d for transmission.\n", DRIVER_NAME, name, i);
+             new_dev->assigned_pin_idx = i;
 
-    pr_info("[%s] sysfs devices created at /sys/class/%s/\n", DRIVER_NAME, CLASS_NAME);
-    return 0;
-}
+             // TODO: 조금더 안전하게 일정기간 관찰하기?
+             gpiod_direction_output(new_dev->data_pins[i], 1);
+             break;
+         }
+         if (i == NUM_DATA_PINS) { ret = -EBUSY; goto err_free_dev; }
 
-static void __exit gpiocom_driver_exit(void) {
-    device_remove_file(slave_dev, &dev_attr_init);
-    device_destroy(gpiocom_class, MKDEV(0, 1));
-    device_remove_file(master_dev, &dev_attr_init);
-    device_destroy(gpiocom_class, MKDEV(0, 0));
-    class_destroy(gpiocom_class);
-    cdev_del(&gpiocom_cdev);
-    unregister_chrdev_region(dev_num_base, MAX_DEVICES);
-    pr_info("[%s] module unloaded\n", DRIVER_NAME);
-}
+     } else {
+         new_dev->assigned_pin_idx = -1;
+     }
 
-module_init(gpiocom_driver_init);
-module_exit(gpiocom_driver_exit);
+     // 4. cdev 및 device 파일 생성
+     cdev_init(&new_dev->cdev, &gpio_comm_fops);
+     new_dev->device = device_create(g_dev_class, NULL, MKDEV(g_major_num, dev_idx), NULL, new_dev->name);
+     if (IS_ERR(new_dev->device)) { ret = PTR_ERR(new_dev->device); goto err_free_dev; }
+     ret = cdev_add(&new_dev->cdev, new_dev->device->devt, 1);
+     if (ret) goto err_destroy_device;
+ 
+     // 5. 타이머 및 대기 큐 초기화
+     timer_setup(&new_dev->timeout_timer, comm_timeout_callback, 0);
+     init_waitqueue_head(&new_dev->wq);
+ 
+     // 6. IRQ 설정 (RW 모드만 데이터 핀 IRQ 필요)
+     new_dev->irqs[0] = gpiod_to_irq(new_dev->ctrl_pin);
+     ret = request_irq(new_dev->irqs[0], ctrl_pin_irq_handler, IRQF_TRIGGER_RISING, "ctrl_pin", new_dev);
+     disable_irq(new_dev->irqs[0]);
+        
+     if (new_dev->mode == MODE_READ_WRITE) {
+         gpiod_direction_output(new_dev->data_pins[pin_idx], 1); // 자신의 핀은 출력 High
+         for (i = 0; i < NUM_DATA_PINS; i++) {
+             if (i == pin_idx) continue;
+             ret = request_irq(g_bus.irqs[i+1], data_pin_irq_handler, IRQF_TRIGGER_RISING, name, new_dev);
+             // ... (에러 처리) ...
+         }
+     }
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("HJH");
-MODULE_DESCRIPTION("GPIO Communication Protocol Driver");
+
+     spin_lock_init(&new_dev->lock);
+     init_waitqueue_head(&new_dev->wq);
+     atomic_set(&new_dev->state, 0);
+     atomic_set(&new_dev->data_ready, 0);
+ 
+     g_dev_table[dev_idx] = new_dev;
+     pr_info("[%s] Device '%s' created (mode: %s, pin_idx: %d).\n", DRIVER_NAME, name, mode_str, pin_idx);
+     return count;
+ 
+ err_destroy_device:
+     device_destroy(g_dev_class, new_dev->device->devt);
+ err_free_dev:
+     kfree(new_dev);
+     return ret;
+ }
+ 
+ static ssize_t unexport_store(struct class *class, struct class_attribute *attr, const char *buf, size_t count) {
+     char name[MAX_NAME_LEN];
+     int i;
+     struct gpio_comm_dev *dev = NULL;
+     
+     sscanf(buf, "%19s", name);
+     
+     spin_lock(&g_bus.lock);
+     for (i = 0; i < MAX_DEVICES; i++) {
+         if (g_dev_table[i] && strcmp(g_dev_table[i]->name, name) == 0) {
+             dev = g_dev_table[i];
+             g_dev_table[i] = NULL;
+             break;
+         }
+     }
+     spin_unlock(&g_bus.lock);
+ 
+     if (dev) {
+         cleanup_device(dev);
+         pr_info("[%s] Device '%s' removed.\n", DRIVER_NAME, name);
+     } else {
+         return -ENOENT;
+     }
+     return count;
+ }
+ 
+ static CLASS_ATTR_WO(export);
+ static CLASS_ATTR_WO(unexport);
+ 
+ static struct attribute *gpio_comm_class_attrs[] = {
+     &class_attr_export.attr,
+     &class_attr_unexport.attr,
+     NULL,
+ };
+ ATTRIBUTE_GROUPS(gpio_comm_class);
+ 
+ 
+ /**
+  * @brief 드라이버 로드 시 호출
+  */
+ static int __init gpio_comm_init(void) {
+     int ret;
+     pr_info("[%s] module loading\n", DRIVER_NAME);
+ 
+     // 1. 전역 버스 구조체 초기화
+     memset(&g_bus, 0, sizeof(g_bus));
+     spin_lock_init(&g_bus.lock);
+     atomic_set(&g_bus.state, BUS_IDLE);
+ 
+     // 2. 캐릭터 디바이스 영역 할당
+     ret = alloc_chrdev_region(&g_major_num, 0, MAX_DEVICES, DRIVER_NAME);
+     if (ret < 0) return ret;
+     g_major_num = MAJOR(g_major_num);
+ 
+     // 3. 클래스 생성 및 sysfs 파일 등록
+     g_dev_class = class_create(CLASS_NAME);
+     if (IS_ERR(g_dev_class)) {
+         unregister_chrdev_region(MKDEV(g_major_num, 0), MAX_DEVICES);
+         return PTR_ERR(g_dev_class);
+     }
+     g_dev_class->class_groups = gpio_comm_class_groups;
+ 
+     return 0;
+ }
+ 
+ /**
+  * @brief 드라이버 언로드 시 호출
+  */
+ static void __exit gpio_comm_exit(void) {
+     int i;
+     for (i = 0; i < MAX_DEVICES; i++) {
+         if (g_dev_table[i]) {
+             cleanup_device(g_dev_table[i]);
+             g_dev_table[i] = NULL;
+         }
+     }
+     
+     // 버스 리소스 해제 (GPIO, IRQ 등)
+     if(g_bus.ctrl_pin) {
+         free_irq(g_bus.irqs[0], NULL);
+         gpiod_put(g_bus.ctrl_pin);
+     }
+     for(i = 0; i < NUM_DATA_PINS; i++) {
+         if(g_bus.data_pins[i]) {
+              // 데이터 핀 IRQ는 개별 디바이스에서 해제됨
+             gpiod_put(g_bus.data_pins[i]);
+         }
+     }
+ 
+     class_destroy(g_dev_class);
+     unregister_chrdev_region(MKDEV(g_major_num, 0), MAX_DEVICES);
+     
+     pr_info("[%s] module unloaded\n", DRIVER_NAME);
+ }
+ 
+ module_init(gpio_comm_init);
+ module_exit(gpio_comm_exit);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("HJH & Gemini");
+ MODULE_DESCRIPTION("Multi-device P2P GPIO Communication Driver");
+ 
+ 
