@@ -108,6 +108,9 @@
      ktime_t last_irq_time;     // 마지막 IRQ 발생 시간. 클럭 간격(속도)을 계산하기 위함.
  
      struct timer_list timeout_timer; // 통신 타임아웃을 감지하기 위한 커널 타이머
+
+     // timestamp
+     ktime_t rx_start_time;
  };
  
 
@@ -251,9 +254,11 @@
  
      received_nibble = read_4bits(dev);
 
+     // SOT 감지
      if (dev->state == COMM_STATE_WAIT_SOT) {
          if (received_nibble == SOT_NIBBLE) {
              dev->state = COMM_STATE_RECEIVING;
+             dev->rx_start_time = ktime_get();
              pr_debug("[%s] %s: ctrl_pin_irq_handler: SOT detected. Switched to RECEIVING state\n", DRIVER_NAME, dev->name);
          }
          else {
@@ -266,7 +271,7 @@
      if (delta_us < (CLOCK_DELAY_US / 2)) return IRQ_HANDLED;
  
  
-     // EOT 감지: 클럭 간격이 정상보다 길고(SLOW_CLK), 데이터 핀이 모두 1이면 EOT.
+     // EOT 감지: 클럭 간격이 정상보다 길고(SLOW_CLK), received_nibble == EOT_NIBBLE이면 EOT.
      if (delta_us > SLOW_CLK_MIN_US) {
          if (received_nibble == EOT_NIBBLE) {
              pr_info("[%s] %s: EOT detected.\n", DRIVER_NAME, dev->name);
@@ -618,8 +623,8 @@
      
     // 2. 수신 결과 확인
     ret = atomic_read(&dev->data_ready);
-    pr_debug("[%s] %s: Data ready with status: %d\n", 
-            DRIVER_NAME, dev->name, ret);
+    pr_debug("[%s] %s: Data ready with status: %d\n", DRIVER_NAME, dev->name, ret);
+    pr_info("[%s] %s: total time: %lld ms, bytes: %d \n", DRIVER_NAME, dev->name, ktime_ms_delta(ktime_get(), dev->rx_start_time), atomic_read(&dev->rx_bytes_done));
             
     atomic_set(&dev->data_ready, 0); // 플래그를 다시 0으로 리셋 (다음 read를 위해)
      
