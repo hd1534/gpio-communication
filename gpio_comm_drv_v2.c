@@ -713,17 +713,15 @@
      pr_debug("[%s] %s: Verifying CRC for %d bytes of payload\n", 
              DRIVER_NAME, dev->name, bytes_to_copy);
      
-     calc_crc = crc16(0, dev->rx_buffer + 2, bytes_to_copy);
+     calc_crc = crc16(0, dev->rx_buffer, 2 + bytes_to_copy); // CRC16 계산 (헤더 포함)
+
      rx_crc = (dev->rx_buffer[dev->expected_rx_len - 1] << 8) | dev->rx_buffer[dev->expected_rx_len - 2];
      
-     pr_debug("[%s] %s: CRC - calculated=0x%04X, received=0x%04X\n", 
-             DRIVER_NAME, dev->name, calc_crc, rx_crc);
+     pr_debug("[%s] %s: CRC - calculated=0x%04X, received=0x%04X\n", DRIVER_NAME, dev->name, calc_crc, rx_crc);
      
      if(calc_crc != rx_crc) { 
-         pr_err("[%s] %s: CRC mismatch! calc=0x%04X, rx=0x%04X\n", 
-                DRIVER_NAME, dev->name, calc_crc, rx_crc); 
-         pr_debug("[%s] %s: Dumping packet (len=%d): %*ph\n",
-                 DRIVER_NAME, dev->name, dev->expected_rx_len, dev->rx_buffer);
+         pr_err("[%s] %s: CRC mismatch! calc=0x%04X, rx=0x%04X\n", DRIVER_NAME, dev->name, calc_crc, rx_crc); 
+         pr_debug("[%s] %s: Dumping packet (16char): %.16s\n", DRIVER_NAME, dev->name, dev->expected_rx_len, dev->rx_buffer);
          return -EBADMSG; // CRC 불일치 에러
      }
  
