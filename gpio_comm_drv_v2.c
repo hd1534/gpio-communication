@@ -179,10 +179,10 @@
          pr_err("[%s] %s: ERROR: toggle_ctrl_clock: Invalid device or control pin\n", DRIVER_NAME, dev->name);
          return;
      }
-     pr_debug("[%s] %s: toggle_ctrl_clock: Toggling control pin (LOW)\n", DRIVER_NAME, dev->name);
+     pr_debug("[%s] %s: toggle_ctrl_clock: Toggling control pin\n", DRIVER_NAME, dev->name);
+
      gpiod_set_value_cansleep(dev->ctrl_pin, 0);
      udelay(CLOCK_DELAY_US);
-     pr_debug("[%s] %s: toggle_ctrl_clock: Toggling control pin (HIGH)\n", DRIVER_NAME, dev->name);
      gpiod_set_value_cansleep(dev->ctrl_pin, 1);
      udelay(CLOCK_DELAY_US);
  }
@@ -499,11 +499,11 @@
      
      // 버스 사용 요청: 내 핀을 토글링 (High -> Low -> High). 다른 장치의 data_pin_irq_handler가 감지.
      gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 0);
-     udelay(50);
+     udelay(CLOCK_DELAY_US);
      gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 1);
-     
      // 다른 노드들이 IRQ를 처리하고 자신의 핀을 Input으로 바꿀 시간을 줌.
-     msleep(10); 
+     msleep(CLOCK_DELAY_US); 
+     gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 0);
      
      // TODO: (프로토콜 강화) 실제로 다른 RW 디바이스들의 핀이 Input으로 전환되었는지 gpiod_get_direction() 등으로 확인하는 로직 필요.
      // 충돌 감지: 예비 클럭 후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
@@ -520,6 +520,7 @@
 
      // 4. 전송 시작
      // 모든 데이터 핀을 출력(Low)으로 설정.
+     gpiod_direction_output(dev->ctrl_pin, 0);
      for (i = 0; i < NUM_DATA_PINS; i++) gpiod_direction_output(dev->data_pins[i], 0);
      
      // 전송 시작을 알리는 예비 클럭킹 3회.
@@ -568,6 +569,7 @@
  
  tx_post_comm:
      // 7. 버스 해제 및 상태 복원 (전송 종료 후)
+     gpiod_direction_input(dev->ctrl_pin);
      for(i=0; i<NUM_DATA_PINS; i++) gpiod_direction_input(dev->data_pins[i]); // 모든 핀을 다시 입력으로
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1); // 내 핀은 다시 출력(High) 상태로 복원
      for (i = 0; i < NUM_DATA_PINS; i++) if (dev->irqs[i+1] > 0) enable_irq(dev->irqs[i+1]); // 데이터핀 IRQ 다시 활성화
