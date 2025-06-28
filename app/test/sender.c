@@ -69,11 +69,6 @@
              printf("Exiting program.\n");
              break;
          }
-         
-         // 입력된 문자열의 길이가 0이면 전송하지 않음
-         if (strlen(buffer) == 0) {
-             continue;
-         }
  
          // 3. `write()` 시스템 콜을 통해 드라이버로 데이터 전송
          // 드라이버의 write 함수가 버스 점유, 데이터 패킷화, 전송을 모두 처리합니다.

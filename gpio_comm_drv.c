@@ -45,7 +45,7 @@
  #define NUM_DATA_PINS 4         // 데이터 핀 개수
  
  #define RX_BUFFER_SIZE 1024     // 수신 버퍼 크기. 최대 패킷 크기보다 커야 함.
- #define CLOCK_DELAY_US 1000     // 1 클럭의 길이 (us). 이 값이 통신 속도를 결정.
+ #define CLOCK_DELAY_US 500     // 1 클럭의 길이 (us). 이 값이 통신 속도를 결정.  (테스트 해보니 500은 안정적으로 되는것 같고 300부터는 가끔식 끊김)
  
  // 클럭 신호의 유효성을 판단하기 위한 시간 경계값 정의
  // ktime_t는 64비트 정수(ns)이므로, 오버플로우를 방지하기 위해 LL(long long) 접미사 사용
@@ -765,8 +765,8 @@
      mutex_lock(&g_dev_lock);
  
 
-     // 1. 입력 파싱: "name,mode,ctrl,d0,d1,d2,d3"
-     // 입력 예시: echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
+     // 1. 입력 파싱: "name,my_pin_idx,ctrl,d0,d1,d2,d3"
+     // 입력 예시: echo "my_dev1,-1,17,27,22,23,24" > /sys/class/gpio_comm/export
      pr_debug("[%s] export_store: parsing input string: %.*s\n", DRIVER_NAME, (int)min(count, (size_t)50), buf);
      if (sscanf(buf, "%19[^,],%d,%d,%d,%d,%d,%d",
                 name, &my_pin_idx, &pins[0], &pins[1], &pins[2], &pins[3], &pins[4]) != 7) {
