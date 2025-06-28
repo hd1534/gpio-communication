@@ -2,15 +2,15 @@
  * @file gpio_comm_drv.c
  * @brief 5-wire 멀티-디바이스 P2P GPIO 통신 드라이버
  * @author HJH (Original Concept), Gemini (Implemented & Refactored)
- * @version 2.3
+ * @version 3.0
  *
  * @note
  * - 이 드라이버는 1개의 제어핀과 4개의 데이터핀을 공유하는 P2P 통신 프로토콜을 구현합니다.
  * - 사용법:
  * 1. 드라이버 로드: insmod gpio_comm_drv.ko
  * 2. 디바이스 생성 (sysfs):
- * echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
- * (이름, 모드(rw/r), 제어핀 bcm, 데이터핀1 bcm, 데이터핀2 bcm, 데이터핀3 bcm, 데이터핀4 bcm)
+ * echo "my_dev1,-1,17,27,22,23,24" > /sys/class/gpio_comm/export
+ * (이름, 전송 시그널을 보낼 핀(-1은 readonly), 제어핀 bcm, 데이터핀1 bcm, 데이터핀2 bcm, 데이터핀3 bcm, 데이터핀4 bcm)
  * 3. 생성된 디바이스 노드(/dev/my_dev1)를 통해 read/write 수행
  * 
  */
@@ -67,12 +67,6 @@
  // 2. Enum 및 구조체 정의
  // =================================================================
  
- // 디바이스 연결 모드
- enum connect_mode {
-    MODE_READ_ONLY,  // 읽기만 가능. 버스 점유 시도 안 함.
-    MODE_READ_WRITE, // 읽기/쓰기 가능. 버스 점유 가능.
- };
- 
  // 디바이스의 현재 통신 상태를 나타내는 상태 머신
  enum comm_state {
     COMM_STATE_UNINITIALIZED, // 초기화 이전 상태
@@ -92,14 +86,12 @@
      struct device *device;     // sysfs에 등록된 디바이스 구조체
      dev_t devt;                // 디바이스 번호 (주+부번호)
  
-     enum connect_mode mode;    // 연결 모드 (R or RW)
- 
      // GPIO 핀 디스크립터. gpiod API를 통해 핀을 제어하기 위한 핸들.
      struct gpio_desc *ctrl_pin;
      struct gpio_desc *data_pins[NUM_DATA_PINS];
-     int my_pin_idx;            // RW 모드일 때, 이 디바이스가 소유한 데이터 핀의 인덱스 (0-3). R 모드는 -1.
+     int my_pin_idx;            // 전송 요청시 사용할 핀의 인덱스 (0-3). -1은 read only.
  
-     int irqs[NUM_DATA_PINS + 1]; // [0]은 제어핀, [1-4]는 데이터핀의 IRQ 번호
+     int ctrl_irq; // 제어핀의 IRQ 번호
  
      // --- 동기화 및 상태 관리 ---
      enum comm_state state;     // 현재 통신 상태
@@ -320,59 +312,6 @@
  
      return IRQ_HANDLED;
  }
- 
- /**
-  * @brief 데이터 핀(D0-D3)의 Falling-edge 인터럽트 핸들러.
-  * @param irq 발생한 IRQ 번호
-  * @param dev_id IRQ 등록 시 전달된 디바이스 포인터
-  * @note 다른 장치가 버스 사용을 요청(핀을 Low로 내림)하는 것을 감지.
-  */
- static irqreturn_t data_pin_irq_handler(int irq, void *dev_id) {
-     if (!dev_id) {
-         pr_err("[%s]: ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME);
-         return IRQ_NONE;
-     }
-     struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
-     unsigned long flags;
-     int i;
-     
-     pr_debug("[%s] %s: data_pin_irq_handler: irq=%d, dev=%p, state=%d\n", 
-              DRIVER_NAME, dev->name, irq, dev, dev->state);
- 
-     spin_lock_irqsave(&dev->lock, flags);
- 
-     // 무시 조건: 1. 내가 유휴(IDLE) 상태가 아님. 2. 내 소유의 핀에서 발생한 IRQ임.
-     if (dev->state != COMM_STATE_IDLE || (dev->my_pin_idx != -1 && irq == dev->irqs[dev->my_pin_idx + 1])) {
-         spin_unlock_irqrestore(&dev->lock, flags);
-         return IRQ_NONE;
-     }
-
-     int nibble = read_4bits(dev);
-     pr_info("[%s] %s: Bus request detected. nibble = %x. Switching to RX mode.\n", DRIVER_NAME, dev->name, nibble);
- 
-     // 1. 상태를 수신(RECEIVING)으로 변경.
-     dev->state = COMM_STATE_RECEIVING;
-     
-     // 2. (RW 모드인 경우) 내 핀을 입력으로 전환하여 버스를 양보.
-     if (dev->my_pin_idx != -1) {
-         gpiod_direction_input(dev->data_pins[dev->my_pin_idx]);
-     }
- 
-     // 4. IRQ 전환: 다른 데이터 핀의 요청은 더 이상 받을 필요 없으므로 비활성화하고,
-     //             제어 핀의 클럭을 감지하도록 제어 핀 IRQ를 활성화.
-     for (i = 0; i < NUM_DATA_PINS; i++) {
-         if(dev->irqs[i+1] > 0) disable_irq_nosync(dev->irqs[i+1]);
-     }
-     enable_irq(dev->irqs[0]);
- 
-     // 5. 수신 타임아웃 타이머 시작.
-     mod_timer(&dev->timeout_timer, jiffies + msecs_to_jiffies(100));
- 
-     spin_unlock_irqrestore(&dev->lock, flags);
- 
-     return IRQ_HANDLED;
- }
- 
 
 
  // =================================================================
@@ -474,10 +413,6 @@
      pr_debug("[%s] %s: TX buffer allocated at %p\n",
               DRIVER_NAME, dev->name, tx_buf);
 
-     // 핀 IRQ 비활성화
-     for (i = 0; i < NUM_DATA_PINS+1; i++) {
-        disable_irq_nosync(dev->irqs[i]);
-     }
  
      // 1. 버스 상태 확인 및 점유 시작 (경쟁 상태 방지)
      spin_lock_irqsave(&dev->lock, flags);
@@ -513,8 +448,6 @@
               DRIVER_NAME, dev->name, crc); // CRC(상위)
      
      // 3. 버스 점유를 위한 준비
-     // 다른 장치의 요청을 받지 않기 위해 데이터핀 IRQ 비활성화
-     for (i = 0; i < NUM_DATA_PINS; i++) if (dev->irqs[i+1] > 0) disable_irq(dev->irqs[i+1]);
      
      // 버스 사용 요청: 내 핀을 토글링 (High -> Low -> High). 다른 장치의 data_pin_irq_handler가 감지.
      gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 0);
@@ -600,10 +533,6 @@
      for(i=0; i<NUM_DATA_PINS; i++) gpiod_direction_input(dev->data_pins[i]); // 모든 핀을 다시 입력으로
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1); // 내 핀은 다시 출력(High) 상태로 복원
  
-     // 핀 IRQ 활성화
-     for (i = 0; i < NUM_DATA_PINS+1; i++) {
-        enable_irq(dev->irqs[i]);
-     }
      
  tx_abort:
      // 8. 최종 상태 복원 및 자원 해제
@@ -662,7 +591,7 @@
         // R/O 모드는 항상 ctrl irq 활성화 필요. RW모드는 data_pin_irq_handler에서 처리.
         if (dev->mode == MODE_READ_ONLY) {
             pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", DRIVER_NAME, dev->name);
-            enable_irq(dev->irqs[0]);
+            enable_irq(dev->ctrl_irq);
         }
     } else {
         pr_err("[%s] %s: Device is not idle, rejected. current state: %d.\n", DRIVER_NAME, dev->name, dev->state);
@@ -732,12 +661,7 @@
      
      // 5. 버스 상태 복원
      spin_lock_irqsave(&dev->lock, flags);
-     disable_irq_nosync(dev->irqs[0]); // 제어핀 IRQ는 일단 비활성화
-     if (dev->mode == MODE_READ_WRITE) {
-         // RW모드는 다시 자신의 핀을 출력(High)으로 만들고, 데이터핀 IRQ들을 활성화하여 다른 노드의 요청을 받을 준비.
-         gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1);
-         for(int i = 0; i < NUM_DATA_PINS; ++i) if (dev->irqs[i+1] > 0) enable_irq(dev->irqs[i+1]);
-     }
+     disable_irq_nosync(dev->ctrl_irq); // 제어핀 IRQ는 일단 비활성화
      dev->state = COMM_STATE_IDLE; // 유휴 상태로 전환
      spin_unlock_irqrestore(&dev->lock, flags);
 
@@ -777,11 +701,9 @@
      pr_debug("[%s] %s: Releasing timer\n", DRIVER_NAME, dev->name);
      del_timer_sync(&dev->timeout_timer);
  
-     pr_debug("[%s] %s: Releasing IRQs\n", DRIVER_NAME, dev->name);
-     for (i = 0; i <= NUM_DATA_PINS; i++) {
-         if (dev->irqs[i] > 0) {
-             free_irq(dev->irqs[i], dev);
-         }
+     pr_debug("[%s] %s: Releasing IRQ\n", DRIVER_NAME, dev->name);
+     if (dev->ctrl_irq) {
+         free_irq(dev->ctrl_irq, dev);
      }
 
      pr_debug("[%s] %s: Releasing GPIOs\n", DRIVER_NAME, dev->name);
@@ -823,8 +745,8 @@
   * @note "이름,모드,핀번호,..." 형식의 문자열을 파싱하여 새 디바이스를 초기화.
   */
  static ssize_t export_store(const struct class *class, const struct class_attribute *attr, const char *buf, size_t count) {
-     char name[MAX_NAME_LEN], mode_str[4];
-     int pins[NUM_DATA_PINS + 1];
+     char name[MAX_NAME_LEN];
+     int my_pin_idx, pins[NUM_DATA_PINS + 1];
      struct gpio_comm_dev *new_dev = NULL;
      int i, dev_idx = -1, ret = 0;
      
@@ -843,8 +765,8 @@
      // 1. 입력 파싱: "name,mode,ctrl,d0,d1,d2,d3"
      // 입력 예시: echo "my_dev1,rw,17,27,22,23,24" > /sys/class/gpio_comm/export
      pr_debug("[%s] export_store: parsing input string: %.*s\n", DRIVER_NAME, (int)min(count, (size_t)50), buf);
-     if (sscanf(buf, "%19[^,],%3[^,],%d,%d,%d,%d,%d",
-                name, mode_str, &pins[0], &pins[1], &pins[2], &pins[3], &pins[4]) != 7) {
+     if (sscanf(buf, "%19[^,],%d,%d,%d,%d,%d,%d",
+                name, &my_pin_idx, &pins[0], &pins[1], &pins[2], &pins[3], &pins[4]) != 7) {
          ret = -EINVAL;
          goto out_unlock;
      }
@@ -874,58 +796,36 @@
      new_dev->rx_buffer_size = RX_BUFFER_SIZE;
      strcpy(new_dev->name, name);
      
-     pr_debug("[%s] export_store: setting mode\n", DRIVER_NAME);
-     if (strcmp(mode_str, "rw") == 0) new_dev->mode = MODE_READ_WRITE;
-     else if (strcmp(mode_str, "r") == 0) new_dev->mode = MODE_READ_ONLY;
-     else { ret = -EINVAL; goto err_free_buffer; }
+     pr_debug("[%s] export_store: setting my_pin_idx to %d\n", DRIVER_NAME, my_pin_idx);
+     new_dev->my_pin_idx = my_pin_idx;
  
-     // GPIO 핀 획득 (gpiod_get 사용, devm_kasprintf로 디바이스에 종속된 이름 할당)
+     // GPIO 핀 획득
      pr_debug("[%s] export_store: getting control pin: %d\n", DRIVER_NAME, pins[0]);
      new_dev->ctrl_pin = gpio_to_desc(GPIOCHIP_BASE + pins[0]);
-
-     for(i = 0; i <= NUM_DATA_PINS; i++) {
-        g_assigned_pins[pins[i]] = 1;
-     }
-
-     if (IS_ERR(new_dev->ctrl_pin)) { ret=PTR_ERR(new_dev->ctrl_pin); goto err_free_buffer; }
- 
+     if (IS_ERR(new_dev->ctrl_pin)) { 
+        ret=PTR_ERR(new_dev->ctrl_pin); 
+        goto err_free_buffer; 
+    } 
      pr_debug("[%s] export_store: getting data pins\n", DRIVER_NAME);
      for (i = 0; i < NUM_DATA_PINS; i++) {
          new_dev->data_pins[i] = gpio_to_desc(GPIOCHIP_BASE + pins[i+1]);
          if (IS_ERR(new_dev->data_pins[i])) { 
              ret = PTR_ERR(new_dev->data_pins[i]); 
              pr_err("[%s] Failed to get data pin %d: %d\n", DRIVER_NAME, i, ret);
-
-             // 실패했으니, 이전에 성공한 핀들 해제
-             for (--i; i >= 0; i--) gpiod_put(new_dev->data_pins[i]);
-             gpiod_put(new_dev->ctrl_pin);
              goto err_free_buffer;
          }
      }
+
+     // 할당된 핀들을 기록
+     for(i = 0; i <= NUM_DATA_PINS; i++) {
+        g_assigned_pins[pins[i]] = 1;
+     }
+
+     // 핀을 전부 input으로 설정
      pr_debug("[%s] export_store: setting pin directions\n", DRIVER_NAME);
      gpiod_direction_input(new_dev->ctrl_pin);
-     for(i=0; i < NUM_DATA_PINS; i++) gpiod_direction_input(new_dev->data_pins[i]);
- 
-     // RW 모드인 경우, 비어있는 데이터 핀을 찾아 점유
-     pr_debug("[%s] export_store: setting mode\n", DRIVER_NAME);
-     if (new_dev->mode == MODE_READ_WRITE) {
-         new_dev->my_pin_idx = -1;
-         for (i = 0; i < NUM_DATA_PINS; i++) {
-             // 다른 장치가 사용 중(High)이 아닌 핀(Low)을 내 핀으로 선택.
-             if (gpiod_get_value_cansleep(new_dev->data_pins[i]) == 0) {
-                 new_dev->my_pin_idx = i;
-                 gpiod_direction_output(new_dev->data_pins[i], 1); // 내 핀임을 알리기 위해 High로 설정
-                 pr_info("[%s] %s: Claimed data pin %d.\n", DRIVER_NAME, name, i);
-                 break;
-             }
-         }
-         if (new_dev->my_pin_idx == -1) {
-             pr_err("[%s] No available data pins for RW mode.\n", DRIVER_NAME);
-             ret = -EBUSY; // 사용 가능한 핀 없음
-             goto err_put_pins;
-         }
-     } else {
-         new_dev->my_pin_idx = -1; // R 모드는 핀 점유 안 함
+     for(i=0; i < NUM_DATA_PINS; i++) {
+        gpiod_direction_input(new_dev->data_pins[i]);
      }
  
      // 캐릭터 디바이스 초기화 및 등록
@@ -950,31 +850,21 @@
      init_waitqueue_head(&new_dev->wq);
      timer_setup(&new_dev->timeout_timer, comm_timeout_callback, 0);
  
-     // IRQ 할당 및 등록
-     pr_debug("[%s] export_store: requesting IRQ\n", DRIVER_NAME);
-     new_dev->irqs[0] = gpiod_to_irq(new_dev->ctrl_pin);
-     if (new_dev->irqs[0] < 0) { ret = new_dev->irqs[0]; goto err_destroy_device; }
-     ret = request_irq(new_dev->irqs[0], ctrl_pin_irq_handler, IRQF_TRIGGER_RISING, "comm_ctrl", new_dev);
-     if (ret) goto err_destroy_device;
-     disable_irq(new_dev->irqs[0]); // write전까진 비활성화
- 
-     if (new_dev->mode == MODE_READ_WRITE){
-        for (i = 0; i < NUM_DATA_PINS; i++) {
-            new_dev->irqs[i+1] = gpiod_to_irq(new_dev->data_pins[i]);
-            if (new_dev->irqs[i+1] < 0) { 
-                ret = new_dev->irqs[i+1]; 
-                goto err_free_irqs; 
-            }
-            // 다른 장치의 요청(High->Low)을 감지해야 하므로 FALLING edge 트리거 사용
-            ret = request_irq(new_dev->irqs[i+1], data_pin_irq_handler, IRQF_TRIGGER_FALLING, "comm_data", new_dev);
-            if (ret) { 
-                new_dev->irqs[i+1] = 0; 
-                goto err_free_irqs;
-            }
-            disable_irq(new_dev->irqs[i+1]); // write전까진 비활성화
-        }
+     // 제어핀 IRQ 생성 (read시 활성화)
+     pr_debug("[%s] export_store: create IRQ for control pin\n", DRIVER_NAME);
+     new_dev->ctrl_irq = gpiod_to_irq(new_dev->ctrl_pin);
+     if (new_dev->ctrl_irq < 0) { 
+        pr_err("[%s] Failed to get IRQ for control pin: %d\n", DRIVER_NAME, new_dev->ctrl_irq);
+        ret = new_dev->ctrl_irq; 
+        goto err_destroy_device; 
     }
-
+     ret = request_irq(new_dev->ctrl_irq, ctrl_pin_irq_handler, IRQF_TRIGGER_RISING, "comm_ctrl", new_dev);
+     if (ret) {
+        pr_err("[%s] Failed to request IRQ for control pin: %d\n", DRIVER_NAME, ret);
+        goto err_destroy_device;
+     }
+     disable_irq(new_dev->ctrl_irq); // read전까진 비활성화
+ 
      // 4. 모든 설정 완료. 전역 테이블에 등록하고 상태를 IDLE로 설정.
      pr_debug("[%s] export_store: setting device state\n", DRIVER_NAME); 
      new_dev->state = COMM_STATE_IDLE;
@@ -989,8 +879,7 @@
  // 할당에 실패했을 경우, 이미 할당된 자원들을 역순으로 깨끗하게 해제.
  err_free_irqs:
      pr_debug("[%s] export_store: freeing IRQs\n", DRIVER_NAME);
-     free_irq(new_dev->irqs[0], new_dev);
-     for(i = 0; i < NUM_DATA_PINS; i++) if(new_dev->irqs[i+1] > 0) free_irq(new_dev->irqs[i+1], new_dev);
+     free_irq(new_dev->ctrl_irq, new_dev);
  err_destroy_device:
      pr_debug("[%s] export_store: destroying device\n", DRIVER_NAME);
      device_destroy(g_dev_class, new_dev->devt);

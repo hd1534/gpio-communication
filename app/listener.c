@@ -10,7 +10,7 @@
  * - 컴파일: gcc -Wall -o listener listener.c
  * - 실행 전 확인:
  * 1. `sudo insmod gpio_comm_drv.ko`  // lsmod | grep gpio_comm_drv로 확인
- * 2. `sudo sh -c 'echo "gpio_listener,r,18,23,25,16,20" > /sys/class/gpio_comm/export'`
+ * 2. `sudo sh -c 'echo "gpio_listener,-1,18,23,25,16,20" > /sys/class/gpio_comm/export'`
  * - 실행: `sudo ./listener`
  */
 
@@ -33,7 +33,7 @@
      ssize_t bytes_read;
      
      // 0. 디바이스 생성
-     system("sudo sh -c 'echo \"gpio_listener,r,18,23,25,16,20\" > /sys/class/gpio_comm/export'");
+     system("sudo sh -c 'echo \"gpio_listener,-1,18,23,25,16,20\" > /sys/class/gpio_comm/export'");
  
      printf("Starting GPIO listener on %s...\n", DEVICE_PATH);
  

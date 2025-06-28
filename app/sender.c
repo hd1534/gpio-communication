@@ -9,7 +9,7 @@
  * - 컴파일: gcc -Wall -o sender sender.c
  * - 실행 전 확인:
  * 1. `sudo insmod gpio_comm_drv.ko`  // lsmod | grep gpio_comm_drv로 확인
- * 2. `sudo sh -c 'echo "gpio_sender,rw,17,22,9,19,26" > /sys/class/gpio_comm/export'`
+ * 2. `sudo sh -c 'echo "gpio_sender,1,17,22,9,19,26" > /sys/class/gpio_comm/export'`
  * - 실행: `sudo ./sender`
  */
 
@@ -32,7 +32,7 @@
      ssize_t bytes_written;
 
      // 0. 디바이스 생성
-     system("sudo sh -c 'echo \"gpio_sender,rw,17,22,9,19,26\" > /sys/class/gpio_comm/export'");
+     system("sudo sh -c 'echo \"gpio_sender,1,17,22,9,19,26\" > /sys/class/gpio_comm/export'");
  
      printf("Starting GPIO sender on %s...\n", DEVICE_PATH);
  
