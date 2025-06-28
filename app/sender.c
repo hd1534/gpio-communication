@@ -30,6 +30,9 @@
      int fd; // 파일 디스크립터
      char buffer[BUFFER_SIZE];
      ssize_t bytes_written;
+
+     // 0. 디바이스 생성
+     system("sudo sh -c 'echo \"gpio_sender,rw,17,22,9,19,26\" > /sys/class/gpio_comm/export'");
  
      printf("Starting GPIO sender on %s...\n", DEVICE_PATH);
  

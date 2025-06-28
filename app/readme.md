@@ -63,6 +63,8 @@ echo in > gpio22/direction
 echo in > gpio9/direction
 echo in > gpio19/direction
 echo in > gpio26/direction
+
+rmmod /home/pi/projects/sysprog_material/gpio_drv.ko
 ```
 
 ## 준비물

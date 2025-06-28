@@ -31,6 +31,9 @@
      int fd; // 파일 디스크립터
      char buffer[BUFFER_SIZE];
      ssize_t bytes_read;
+     
+     // 0. 디바이스 생성
+     system("sudo sh -c 'echo \"gpio_listener,r,18,23,25,16,20\" > /sys/class/gpio_comm/export'");
  
      printf("Starting GPIO listener on %s...\n", DEVICE_PATH);
  
