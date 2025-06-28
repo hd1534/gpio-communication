@@ -58,6 +58,9 @@
  // `gpioinfo` 명령어로 실제 base를 확인해야 할 수 있음.
  #define GPIOCHIP_BASE 512
 
+ // Start Of Transmission, End Of Transmission 니블 정의
+ #define SOT_NIBBLE 0x0F
+ #define EOT_NIBBLE 0x0F
 
 
  // =================================================================
@@ -76,6 +79,7 @@
     COMM_STATE_IDLE,          // 유휴 상태. 읽기/쓰기 시작 가능.
     COMM_STATE_WAIT_BUS,      // [v2.2] 쓰기 요청 후, 다른 장치가 버스를 양보하기를 기다리는 상태
     COMM_STATE_SENDING,       // 데이터 송신 중인 상태
+    COMM_STATE_WAIT_SOT,      // [v2.3] SOT 신호를 기다리는 상태
     COMM_STATE_RECEIVING,     // 데이터 수신 중인 상태
     COMM_STATE_DONE,          // 작업 완료 (사용되지 않음)
     COMM_STATE_ERROR          // 오류 발생 상태 (사용되지 않음)
@@ -253,14 +257,26 @@
      dev->last_irq_time = now;
      pr_debug("[%s] %s: ctrl_pin_irq_handler: Delta time = %lld us\n", DRIVER_NAME, dev->name, delta_us);
  
+     received_nibble = read_4bits(dev);
+
+     if (dev->state == COMM_STATE_WAIT_SOT) {
+         if (received_nibble == SOT_NIBBLE) {
+             dev->state = COMM_STATE_RECEIVING;
+             pr_debug("[%s] %s: ctrl_pin_irq_handler: SOT detected. Switched to RECEIVING state\n", DRIVER_NAME, dev->name);
+         }
+         else {
+            pr_debug("[%s] %s: ctrl_pin_irq_handler: SOT not detected. waiting for SOT\n", DRIVER_NAME, dev->name);
+         }
+         return IRQ_HANDLED;
+     }
+     
      // 너무 짧은 간격의 신호는 노이즈로 간주하고 무시 (디바운싱)
      if (delta_us < (CLOCK_DELAY_US / 2)) return IRQ_HANDLED;
  
-     received_nibble = read_4bits(dev);
  
      // EOT 감지: 클럭 간격이 정상보다 길고(SLOW_CLK), 데이터 핀이 모두 1이면 EOT.
      if (delta_us > SLOW_CLK_MIN_US) {
-         if (received_nibble == 0x0F) {
+         if (received_nibble == EOT_NIBBLE) {
              pr_info("[%s] %s: EOT detected.\n", DRIVER_NAME, dev->name);
              atomic_set(&dev->data_ready, 1); // 성공적으로 수신 완료
          } else {
@@ -543,6 +559,10 @@
      spin_lock_irqsave(&dev->lock, flags);
      dev->state = COMM_STATE_SENDING;
      spin_unlock_irqrestore(&dev->lock, flags);
+
+     // SOT 신호 전송
+     write_4bits(dev, SOT_NIBBLE);
+     toggle_ctrl_clock(dev);
  
      // 5. 실제 데이터 전송 (1바이트 = 2클럭)
      pr_debug("[%s] %s: Starting data transmission (%zu bytes total)\n",
@@ -567,7 +587,7 @@
      
      // 6. EOT 신호 전송 (느린 클럭 + 데이터핀 모두 High)
      pr_debug("[%s] %s: Sending EOT signal\n", DRIVER_NAME, dev->name);
-     write_4bits(dev, 0x0F);
+     write_4bits(dev, EOT_NIBBLE);
      gpiod_set_value_cansleep(dev->ctrl_pin, 0);
      usleep_range(CLOCK_DELAY_US * 3, CLOCK_DELAY_US * 3 + 100);
      gpiod_set_value_cansleep(dev->ctrl_pin, 1);
@@ -635,30 +655,25 @@
          // 읽기 대기 전, 수신 모드로 확실히 전환. (R/O 모드의 경우 항상 수신 대기)
          spin_lock_irqsave(&dev->lock, flags);
          if (dev->state == COMM_STATE_IDLE) {
-             dev->state = COMM_STATE_RECEIVING;
-             pr_debug("[%s] %s: Changed state to RECEIVING\n", 
-                     DRIVER_NAME, dev->name);
+             dev->state = COMM_STATE_WAIT_SOT;
+             pr_debug("[%s] %s: Changed state to WAIT_SOT\n", DRIVER_NAME, dev->name);
              // R/O 모드는 항상 ctrl irq 활성화 필요. RW모드는 data_pin_irq_handler에서 처리.
              if (dev->mode == MODE_READ_ONLY) {
-                 pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", 
-                         DRIVER_NAME, dev->name);
+                 pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", DRIVER_NAME, dev->name);
                  enable_irq(dev->irqs[0]);
              }
          } else {
-             pr_debug("[%s] %s: Device already in state %d, not changing to RECEIVING\n", 
-                     DRIVER_NAME, dev->name, dev->state);
+             pr_err("[%s] %s: Device is not idle, rejected. current state: %d.\n", DRIVER_NAME, dev->name, dev->state);
+             return -EBUSY;
          }
          spin_unlock_irqrestore(&dev->lock, flags);
          
          // data_ready 플래그가 0이 아닐 때까지 대기 큐에서 잠듦.
          // 인터럽트로 깨어날 수 있음 (-ERESTARTSYS).
-         pr_debug("[%s] %s: Waiting for data (current data_ready=%d)...\n", 
-                 DRIVER_NAME, dev->name, atomic_read(&dev->data_ready));
-                 
+         pr_debug("[%s] %s: Waiting for data (current data_ready=%d)...\n", DRIVER_NAME, dev->name, atomic_read(&dev->data_ready));
          ret = wait_event_interruptible(dev->wq, atomic_read(&dev->data_ready) != 0);
          if (ret) {
-             pr_debug("[%s] %s: Read wait interrupted by signal (ret=%d)\n", 
-                     DRIVER_NAME, dev->name, ret);
+             pr_debug("[%s] %s: Read wait interrupted by signal (ret=%d)\n", DRIVER_NAME, dev->name, ret);
              return -ERESTARTSYS;
          }
      }
@@ -685,14 +700,11 @@
      
      // 헤더에서 전체 길이 정보를 읽음
      dev->expected_rx_len = (dev->rx_buffer[1] << 8) | dev->rx_buffer[0];
-     pr_debug("[%s] %s: Packet header - expected length: %u, actual received: %d\n", 
-             DRIVER_NAME, dev->name, dev->expected_rx_len, atomic_read(&dev->rx_bytes_done));
+     pr_debug("[%s] %s: Packet header - expected length: %u, actual received: %d\n", DRIVER_NAME, dev->name, dev->expected_rx_len, atomic_read(&dev->rx_bytes_done));
      
      if (dev->expected_rx_len != atomic_read(&dev->rx_bytes_done)) {
-         pr_err("[%s] %s: RX length mismatch. expected=%u, got=%d\n", 
-                DRIVER_NAME, dev->name, dev->expected_rx_len, atomic_read(&dev->rx_bytes_done));
-         pr_debug("[%s] %s: Dumping first 16 bytes of rx_buffer: %*ph\n",
-                 DRIVER_NAME, dev->name, 16, dev->rx_buffer);
+         pr_err("[%s] %s: RX length mismatch. expected=%u, got=%d\n", DRIVER_NAME, dev->name, dev->expected_rx_len, atomic_read(&dev->rx_bytes_done));
+         pr_debug("[%s] %s: Dumping first 16 bytes of rx_buffer: %*ph\n", DRIVER_NAME, dev->name, 16, dev->rx_buffer);
          return -EIO; // 길이 불일치 에러
      }
      
