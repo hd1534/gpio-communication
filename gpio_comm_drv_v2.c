@@ -54,6 +54,11 @@
  #define TIMEOUT_MIN_US    (CLOCK_DELAY_US * 10LL)         // 10배 이상은 타임아웃으로 간주 (사용되지 않음, timeout_timer로 대체)
  
 
+ // 라즈베리 파이의 GPIO 컨트롤러(BCM2835)의 기본 번호. 커널 내부에서 GPIO를 식별할 때 사용.
+ // `gpioinfo` 명령어로 실제 base를 확인해야 할 수 있음.
+ #define GPIOCHIP_BASE 512
+
+
 
  // =================================================================
  // 2. Enum 및 구조체 정의
@@ -119,6 +124,8 @@
  static struct gpio_comm_dev *g_dev_table[MAX_DEVICES];
  static int g_major_num;        // 할당받은 주 번호
  static struct class *g_dev_class; // sysfs에 "/sys/class/gpio_comm"을 생성하기 위한 클래스 구조체
+
+ static int g_assigned_pins[NUM_DATA_PINS + 1] = {0};
  
  // [v2.2] export/unexport 동작 중 g_dev_table 접근을 보호하기 위한 전역 뮤텍스.
  // sysfs 콜백은 sleep이 가능하므로 spinlock이 아닌 mutex를 사용.
@@ -169,13 +176,13 @@
  // 제어 핀을 Low -> High로 토글하여 1 클럭 신호를 생성
  static void toggle_ctrl_clock(struct gpio_comm_dev *dev) {
      if (unlikely(!dev || !dev->ctrl_pin)) {
-         pr_err("[%s] ERROR: toggle_ctrl_clock: Invalid device or control pin\n", DRIVER_NAME);
+         pr_err("[%s] %s: ERROR: toggle_ctrl_clock: Invalid device or control pin\n", DRIVER_NAME, dev->name);
          return;
      }
-     pr_debug("[%s] toggle_ctrl_clock: Toggling control pin (LOW)\n", DRIVER_NAME);
+     pr_debug("[%s] %s: toggle_ctrl_clock: Toggling control pin (LOW)\n", DRIVER_NAME, dev->name);
      gpiod_set_value_cansleep(dev->ctrl_pin, 0);
      udelay(CLOCK_DELAY_US);
-     pr_debug("[%s] toggle_ctrl_clock: Toggling control pin (HIGH)\n", DRIVER_NAME);
+     pr_debug("[%s] %s: toggle_ctrl_clock: Toggling control pin (HIGH)\n", DRIVER_NAME, dev->name);
      gpiod_set_value_cansleep(dev->ctrl_pin, 1);
      udelay(CLOCK_DELAY_US);
  }
@@ -235,16 +242,16 @@
      unsigned long flags;
      int current_byte_idx;
      
-     pr_debug("[%s] ctrl_pin_irq_handler: dev=%p, state=%d\n", DRIVER_NAME, dev, dev->state);
+     pr_debug("[%s] %s: ctrl_pin_irq_handler: dev=%p, state=%d\n", DRIVER_NAME, dev->name, dev, dev->state);
  
      // 클럭이 감지되었으므로, 타임아웃 타이머를 리셋하여 시간을 연장.
-     pr_debug("[%s] ctrl_pin_irq_handler: Resetting timeout timer\n", DRIVER_NAME);
+     pr_debug("[%s] %s: ctrl_pin_irq_handler: Resetting timeout timer\n", DRIVER_NAME, dev->name);
      mod_timer(&dev->timeout_timer, jiffies + msecs_to_jiffies(50));
  
      now = ktime_get();
      delta_us = ktime_us_delta(now, dev->last_irq_time);
      dev->last_irq_time = now;
-     pr_debug("[%s] ctrl_pin_irq_handler: Delta time = %lld us\n", DRIVER_NAME, delta_us);
+     pr_debug("[%s] %s: ctrl_pin_irq_handler: Delta time = %lld us\n", DRIVER_NAME, dev->name, delta_us);
  
      // 너무 짧은 간격의 신호는 노이즈로 간주하고 무시 (디바운싱)
      if (delta_us < (CLOCK_DELAY_US / 2)) return IRQ_HANDLED;
@@ -254,10 +261,10 @@
      // EOT 감지: 클럭 간격이 정상보다 길고(SLOW_CLK), 데이터 핀이 모두 1이면 EOT.
      if (delta_us > SLOW_CLK_MIN_US) {
          if (received_nibble == 0x0F) {
-             pr_info("[%s] EOT detected.\n", DRIVER_NAME);
+             pr_info("[%s] %s: EOT detected.\n", DRIVER_NAME, dev->name);
              atomic_set(&dev->data_ready, 1); // 성공적으로 수신 완료
          } else {
-             pr_warn("[%s] Invalid EOT signal (data: 0x%02X).\n", DRIVER_NAME, received_nibble);
+             pr_warn("[%s] %s: Invalid EOT signal (data: 0x%02X).\n", DRIVER_NAME, dev->name, received_nibble);
              atomic_set(&dev->data_ready, -EIO); // 잘못된 신호
          }
          del_timer_sync(&dev->timeout_timer); // 통신이 끝났으므로 타이머 완전 제거
@@ -276,7 +283,7 @@
  
      // 버퍼 오버플로우 방지
      if (current_byte_idx >= dev->rx_buffer_size) {
-         pr_err("[%s] RX buffer overflow!\n", DRIVER_NAME);
+         pr_err("[%s] %s: RX buffer overflow!\n", DRIVER_NAME, dev->name);
          atomic_set(&dev->data_ready, -ENOMEM);
          del_timer_sync(&dev->timeout_timer);
          wake_up_interruptible(&dev->wq);
@@ -306,15 +313,15 @@
   */
  static irqreturn_t data_pin_irq_handler(int irq, void *dev_id) {
      if (!dev_id) {
-         pr_err("[%s] ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME);
+         pr_err("[%s] %s: ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME, dev->name);
          return IRQ_NONE;
      }
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
      unsigned long flags;
      int i;
      
-     pr_debug("[%s] data_pin_irq_handler: irq=%d, dev=%p, state=%d\n", 
-              DRIVER_NAME, irq, dev, dev->state);
+     pr_debug("[%s] %s: data_pin_irq_handler: irq=%d, dev=%p, state=%d\n", 
+              DRIVER_NAME, dev->name, irq, dev, dev->state);
  
      spin_lock_irqsave(&dev->lock, flags);
  
@@ -324,7 +331,7 @@
          return IRQ_NONE;
      }
  
-     pr_info("[%s] Bus request detected. Switching to RX mode.\n", DRIVER_NAME);
+     pr_info("[%s] %s: Bus request detected. Switching to RX mode.\n", DRIVER_NAME, dev->name);
  
      // 1. 상태를 수신(RECEIVING)으로 변경.
      dev->state = COMM_STATE_RECEIVING;
@@ -365,19 +372,19 @@
      struct gpio_comm_dev *dev;
      
      if (!inode || !filp) {
-         pr_err("[%s] ERROR: gpio_comm_open: inode or filp is NULL\n", DRIVER_NAME);
+         pr_err("[%s] %s: ERROR: gpio_comm_open: inode or filp is NULL\n", DRIVER_NAME, dev->name);
          return -EINVAL;
      }
      
      // container_of 매크로를 이용해 cdev 멤버 변수 주소로부터 부모 구조체(gpio_comm_dev)의 주소를 계산.
      dev = container_of(inode->i_cdev, struct gpio_comm_dev, cdev);
      if (!dev) {
-         pr_err("[%s] ERROR: gpio_comm_open: Failed to get device from inode\n", DRIVER_NAME);
+         pr_err("[%s] %s: ERROR: gpio_comm_open: Failed to get device from inode\n", DRIVER_NAME, dev->name);
          return -ENODEV;
      }
      
      filp->private_data = dev; // file 구조체에 디바이스 포인터를 저장하여 read/write 등에서 사용.
-     pr_info("[%s] Device '%s' opened. Device ptr: %p\n", DRIVER_NAME, dev->name, dev);
+     pr_info("[%s] %s: Device '%s' opened. Device ptr: %p\n", DRIVER_NAME, dev->name, dev->name, dev);
      return 0;
  }
  
@@ -385,12 +392,12 @@
      struct gpio_comm_dev *dev = filp->private_data;
      
      if (!dev) {
-         pr_err("[%s] ERROR: gpio_comm_release: NULL device pointer\n", DRIVER_NAME);
+         pr_err("[%s] %s: ERROR: gpio_comm_release: NULL device pointer\n", DRIVER_NAME, dev->name);
          return -EINVAL;
      }
      
-     pr_info("[%s] Device '%s' (ptr: %p) released.\n", 
-             DRIVER_NAME, dev->name, dev);
+     pr_info("[%s] %s: Device '%s' (ptr: %p) released.\n", 
+             DRIVER_NAME, dev->name, dev->name, dev);
      
      // 상태 초기화
      spin_lock_irq(&dev->lock);
@@ -497,8 +504,20 @@
      
      // 다른 노드들이 IRQ를 처리하고 자신의 핀을 Input으로 바꿀 시간을 줌.
      msleep(10); 
+     
      // TODO: (프로토콜 강화) 실제로 다른 RW 디바이스들의 핀이 Input으로 전환되었는지 gpiod_get_direction() 등으로 확인하는 로직 필요.
- 
+     // 충돌 감지: 예비 클럭 후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
+     if (gpiod_get_value(dev->ctrl_pin) != 0) {
+        pr_err("[%s] %s: ctrl_pin collision detected! Aborting TX.\n", DRIVER_NAME, dev->name);
+        ret = -EAGAIN; // 충돌 발생, 재시도 필요
+        goto tx_post_comm;
+     }
+     if (read_4bits(dev) != 0) {
+        pr_err("[%s] %s: Bus collision detected! Aborting TX.\n", DRIVER_NAME, dev->name);
+        ret = -EAGAIN; // 충돌 발생, 재시도 필요
+        goto tx_post_comm;
+    }
+
      // 4. 전송 시작
      // 모든 데이터 핀을 출력(Low)으로 설정.
      for (i = 0; i < NUM_DATA_PINS; i++) gpiod_direction_output(dev->data_pins[i], 0);
@@ -508,7 +527,7 @@
  
      // 충돌 감지: 예비 클럭 후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
      if (read_4bits(dev) != 0) {
-         pr_err("[%s] Bus collision detected! Aborting TX.\n", DRIVER_NAME);
+         pr_err("[%s] %s: Bus collision detected2! Aborting TX.\n", DRIVER_NAME, dev->name);
          ret = -EAGAIN; // 충돌 발생, 재시도 필요
          goto tx_post_comm;
      }
@@ -719,7 +738,7 @@
   * @note unexport 시 또는 모듈 종료 시 호출됨.
   */
  static void release_all_resources(struct gpio_comm_dev *dev) {
-     int i;
+     int i, bcm;
      if (!dev) {
          pr_err("[%s] ERROR: release_all_resources called with NULL device\n", DRIVER_NAME);
          return;
@@ -728,27 +747,45 @@
              DRIVER_NAME, dev->name, dev);
  
      // 타이머, IRQ, GPIO, 디바이스, cdev, 메모리 순으로 할당의 역순으로 해제.
+     pr_debug("[%s] %s: Releasing timer\n", DRIVER_NAME, dev->name);
      del_timer_sync(&dev->timeout_timer);
  
+     pr_debug("[%s] %s: Releasing IRQs\n", DRIVER_NAME, dev->name);
      for (i = 0; i <= NUM_DATA_PINS; i++) {
          if (dev->irqs[i] > 0) {
              free_irq(dev->irqs[i], dev);
          }
      }
-     if (dev->ctrl_pin) gpiod_put(dev->ctrl_pin);
+
+     pr_debug("[%s] %s: Releasing GPIOs\n", DRIVER_NAME, dev->name);
+     if (dev->ctrl_pin) {
+        if (gpiod_direction_input(dev->ctrl_pin)) {
+            pr_err("[%s] %s: Failed to set ctrl pin as input\n", 
+                   DRIVER_NAME, dev->name);
+            return -EINVAL;
+        }
+     }
      for (i = 0; i < NUM_DATA_PINS; i++) {
          if (dev->data_pins[i]) {
-             gpiod_put(dev->data_pins[i]);
+            if (gpiod_direction_input(dev->data_pins[i])) {
+                pr_err("[%s] %s: Failed to set data pin %d as input\n", 
+                       DRIVER_NAME, dev->name, i);
+                return -EINVAL;
+            }
+            bcm = desc_to_gpio(dev->data_pins[i]) - GPIOCHIP_BASE;
+            g_assigned_pins[bcm] = 0;
          }
      }
-     
+
+     pr_debug("[%s] %s: Releasing device\n", DRIVER_NAME, dev->name);
      if (dev->device) {
          device_destroy(g_dev_class, dev->devt);
      }
      if (dev->cdev.dev) {
         cdev_del(&dev->cdev);
      }
- 
+
+     pr_debug("[%s] %s: Releasing memory\n", DRIVER_NAME, dev->name); 
      kfree(dev->rx_buffer);
      kfree(dev);
  }
@@ -815,13 +852,18 @@
      else { ret = -EINVAL; goto err_free_buffer; }
  
      // GPIO 핀 획득 (gpiod_get 사용, devm_kasprintf로 디바이스에 종속된 이름 할당)
-     pr_debug("[%s] export_store: getting control pin\n", DRIVER_NAME);
-     new_dev->ctrl_pin = gpiod_get(NULL, devm_kasprintf(GFP_KERNEL, "gpio_comm_ctrl_%d", pins[0]), GPIOD_ASIS);
+     pr_debug("[%s] export_store: getting control pin: %d\n", DRIVER_NAME, pins[0]);
+     new_dev->ctrl_pin = gpio_to_desc(GPIOCHIP_BASE + pins[0]);
+
+     for(i = 0; i <= NUM_DATA_PINS; i++) {
+        g_assigned_pins[pins[i]] = 1;
+     }
+
      if (IS_ERR(new_dev->ctrl_pin)) { ret=PTR_ERR(new_dev->ctrl_pin); goto err_free_buffer; }
  
      pr_debug("[%s] export_store: getting data pins\n", DRIVER_NAME);
      for (i = 0; i < NUM_DATA_PINS; i++) {
-         new_dev->data_pins[i] = gpiod_get(NULL, devm_kasprintf(GFP_KERNEL, "gpio_comm_data_%d", pins[i+1]), GPIOD_ASIS);
+         new_dev->data_pins[i] = gpio_to_desc(GPIOCHIP_BASE + pins[i+1]);
          if (IS_ERR(new_dev->data_pins[i])) { 
              ret = PTR_ERR(new_dev->data_pins[i]); 
              pr_err("[%s] Failed to get data pin %d: %d\n", DRIVER_NAME, i, ret);
