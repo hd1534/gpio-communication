@@ -454,11 +454,18 @@
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1);
      udelay(CLOCK_DELAY_US * 5);
      
-     // 충돌 감지: 요청후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
-     if (read_4bits(dev) != 0x00 || gpiod_get_value(dev->ctrl_pin) != 0) {
-        pr_err("[%s] %s: Bus collision detected! Aborting TX.\n", DRIVER_NAME, dev->name);
+     // 충돌 감지: 요청후 버스를 읽었을 때 본인 핀을 제외한 핀이 High이면 다른 장치도 동시에 전송을 시도했다는 의미.
+     if (gpiod_get_value(dev->ctrl_pin) != 0) {
+        pr_err("[%s] %s: Bus collision detected!, ctrl pin is high. Aborting TX.\n", DRIVER_NAME, dev->name);
         ret = -EBUSY; // 다른 디바이스랑 충돌
         goto tx_post_comm;
+     }
+     for (int i = 0; i < NUM_DATA_PINS; i++) {
+        if (i != dev->my_pin_idx && gpiod_get_value(dev->data_pins[i]) != 0) {
+            pr_err("[%s] %s: Bus collision detected! %d pin is high. Aborting TX.\n", DRIVER_NAME, dev->name, i);
+            ret = -EBUSY; // 다른 디바이스랑 충돌
+            goto tx_post_comm;
+        }
     }
 
      // 4. 전송 시작
@@ -523,8 +530,9 @@
  tx_post_comm:
      // 7. 버스 해제 및 상태 복원 (전송 종료 후)
      gpiod_direction_input(dev->ctrl_pin);
-     for(i=0; i<NUM_DATA_PINS; i++) gpiod_direction_input(dev->data_pins[i]); // 모든 핀을 다시 입력으로
-     gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1); // 내 핀은 다시 출력(High) 상태로 복원
+     for(i=0; i<NUM_DATA_PINS; i++) {
+        gpiod_direction_input(dev->data_pins[i]); // 모든 핀을 다시 입력으로
+     }
  
      
  tx_abort:
@@ -539,6 +547,10 @@
      pr_debug("[%s] %s: gpio_comm_write: Exit. Wrote %zu bytes\n",
               DRIVER_NAME, dev->name, count);
 
+    
+     if (ret < 0) {
+         return ret;
+     }
      
      return count;
  }
@@ -767,6 +779,12 @@
      }
  
      // 2. 유효성 검사 (빈 슬롯, 이름 중복)
+     if (my_pin_idx < -1 || NUM_DATA_PINS <my_pin_idx) {
+         pr_err("[%s] ERROR: export_store: Invalid my_pin_idx: %d\n", DRIVER_NAME, my_pin_idx);
+         ret = -EINVAL;
+         goto out_unlock;
+     }
+
      pr_debug("[%s] export_store: checking for available slot and duplicate name\n", DRIVER_NAME);
      for (i = 0; i < MAX_DEVICES; i++) {
          if (!g_dev_table[i] && dev_idx == -1) dev_idx = i;
