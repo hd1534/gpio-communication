@@ -394,79 +394,70 @@
      pr_debug("[%s] %s: Total packet length: %zu (data: %zu + header: 2 + CRC: 2)\n",
               DRIVER_NAME, dev->name, total_len, count);
  
-     // RW 모드가 아니면 쓰기 불가
-     if (dev->mode != MODE_READ_WRITE) {
-         pr_err("[%s] %s: Write attempted in non-RW mode (mode=%d)\n",
-                DRIVER_NAME, dev->name, dev->mode);
+     // mypin이 -1이면 쓰기 불가
+     if (dev->mypin == -1) {
+         pr_err("[%s] %s: Write attempted without mypin (mypin=%d)\n", DRIVER_NAME, dev->name, dev->mypin);
          return -EPERM;
      }
- 
-     // 커널 공간에 전송 버퍼 할당
-     pr_debug("[%s] %s: Allocating TX buffer of size %zu bytes\n",
-              DRIVER_NAME, dev->name, total_len);
-     tx_buf = kmalloc(total_len, GFP_KERNEL);
-     if (!tx_buf) {
-         pr_err("[%s] %s: Failed to allocate TX buffer (size=%zu)\n",
-                DRIVER_NAME, dev->name, total_len);
-         return -ENOMEM;
-     }
-     pr_debug("[%s] %s: TX buffer allocated at %p\n",
-              DRIVER_NAME, dev->name, tx_buf);
 
  
-     // 1. 버스 상태 확인 및 점유 시작 (경쟁 상태 방지)
-     spin_lock_irqsave(&dev->lock, flags);
-     if (dev->state != COMM_STATE_IDLE) { // 다른 작업 중이면 -EBUSY
-         spin_unlock_irqrestore(&dev->lock, flags);
-         pr_err("[%s] %s: Device is busy (state=%d), cannot start write\n",
-                DRIVER_NAME, dev->name, dev->state);
-         kfree(tx_buf);
-         return -EBUSY;
+     // 1. 커널 공간에 전송 버퍼 할당
+     pr_debug("[%s] %s: Allocating TX buffer of size %zu bytes\n", DRIVER_NAME, dev->name, total_len);
+     tx_buf = kmalloc(total_len, GFP_KERNEL);
+     if (!tx_buf) {
+         pr_err("[%s] %s: Failed to allocate TX buffer (size=%zu)\n", DRIVER_NAME, dev->name, total_len);
+         return -ENOMEM;
      }
-     dev->state = COMM_STATE_WAIT_BUS; // 상태 변경
-     spin_unlock_irqrestore(&dev->lock, flags);
-     pr_debug("[%s] %s: Device state changed to WAIT_BUS for write operation\n",
-              DRIVER_NAME, dev->name);
- 
+     pr_debug("[%s] %s: TX buffer allocated at %p\n", DRIVER_NAME, dev->name, tx_buf);
+
+
      // 2. 유저 공간에서 커널 버퍼로 데이터 복사 및 패킷 구성
-     pr_debug("[%s] %s: Copying %zu bytes from user space to kernel buffer\n",
-              DRIVER_NAME, dev->name, count);
+     pr_debug("[%s] %s: Copying %zu bytes from user space to kernel buffer\n", DRIVER_NAME, dev->name, count);
      if (copy_from_user(tx_buf + 2, buf, count)) {
-         pr_err("[%s] %s: Failed to copy %zu bytes from user space\n",
-                DRIVER_NAME, dev->name, count);
+         pr_err("[%s] %s: Failed to copy %zu bytes from user space\n", DRIVER_NAME, dev->name, count);
          ret = -EFAULT;
          goto tx_abort;
      }
-     pr_debug("[%s] %s: Successfully copied data from user space\n",
-              DRIVER_NAME, dev->name);
+     pr_debug("[%s] %s: Successfully copied data from user space\n", DRIVER_NAME, dev->name);
      tx_buf[0] = (u8)(total_len & 0xFF);         // 헤더: 길이(하위)
      tx_buf[1] = (u8)((total_len >> 8) & 0xFF);     // 3. CRC 계산 및 패킷 완성
      crc = crc16(0, tx_buf, total_len - 2); // CRC16 계산 (마지막 2바이트 제외)
      tx_buf[total_len - 2] = (u8)(crc & 0xFF);
      tx_buf[total_len - 1] = (u8)((crc >> 8) & 0xFF);
-     pr_debug("[%s] %s: CRC calculated: 0x%04X\n",
-              DRIVER_NAME, dev->name, crc); // CRC(상위)
+     pr_debug("[%s] %s: CRC calculated: 0x%04X\n", DRIVER_NAME, dev->name, crc); // CRC(상위)
      
+
      // 3. 버스 점유를 위한 준비
-     
-     // 버스 사용 요청: 내 핀을 토글링 (High -> Low -> High). 다른 장치의 data_pin_irq_handler가 감지.
-     gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 0);
-     udelay(CLOCK_DELAY_US);
-     gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 1);
-     // 다른 노드들이 IRQ를 처리하고 자신의 핀을 Input으로 바꿀 시간을 줌.
-     msleep(CLOCK_DELAY_US); 
-     gpiod_set_value_cansleep(dev->data_pins[dev->my_pin_idx], 0);
-     
-     // TODO: (프로토콜 강화) 실제로 다른 RW 디바이스들의 핀이 Input으로 전환되었는지 gpiod_get_direction() 등으로 확인하는 로직 필요.
-     // 충돌 감지: 예비 클럭 후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
-     if (gpiod_get_value(dev->ctrl_pin) != 0) {
-        pr_err("[%s] %s: ctrl_pin collision detected! Aborting TX.\n", DRIVER_NAME, dev->name);
-        ret = -EAGAIN; // 충돌 발생, 재시도 필요
-        goto tx_post_comm;
+     // 버스 상태 확인 및 점유 시작 (경쟁 상태 방지)
+     spin_lock_irqsave(&dev->lock, flags);
+     if (dev->state != COMM_STATE_IDLE) { // 다른 작업 중이면 -EBUSY
+         spin_unlock_irqrestore(&dev->lock, flags);
+         pr_err("[%s] %s: Device is busy (state=%d), cannot start write\n", DRIVER_NAME, dev->name, dev->state);
+         kfree(tx_buf);
+         return -EBUSY;
      }
-     if (read_4bits(dev) != 0) {
+     dev->state = COMM_STATE_WAIT_BUS; // 상태 변경
+     spin_unlock_irqrestore(&dev->lock, flags);
+     pr_debug("[%s] %s: Device state changed to WAIT_BUS for write operation\n", DRIVER_NAME, dev->name);
+
+     // 안전하게 3번정도 확인
+     for (int i = 0; i < 3; i++) {
+        if (read_4bits(dev) != 0x00 || gpiod_get_value(dev->ctrl_pin) != 0) {
+            pr_err("[%s] %s: Bus already in use! Aborting TX.\n", DRIVER_NAME, dev->name);
+            ret = -EBUSY; // 다른 디바이스가 버스 점유 중
+            goto tx_post_comm;
+        }
+        udelay(CLOCK_DELAY_US);
+     }
+
+     // 버스 사용 요청: 내 핀을 High로 설정.
+     gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1);
+     udelay(CLOCK_DELAY_US * 5);
+     
+     // 충돌 감지: 요청후 버스를 읽었을 때 0이 아니면 다른 장치도 동시에 전송을 시도했다는 의미.
+     if (read_4bits(dev) != 0x00 || gpiod_get_value(dev->ctrl_pin) != 0) {
         pr_err("[%s] %s: Bus collision detected! Aborting TX.\n", DRIVER_NAME, dev->name);
-        ret = -EAGAIN; // 충돌 발생, 재시도 필요
+        ret = -EBUSY; // 다른 디바이스랑 충돌
         goto tx_post_comm;
     }
 
@@ -494,6 +485,7 @@
      write_4bits(dev, SOT_NIBBLE);
      toggle_ctrl_clock(dev);
  
+
      // 5. 실제 데이터 전송 (1바이트 = 2클럭)
      pr_debug("[%s] %s: Starting data transmission (%zu bytes total)\n",
               DRIVER_NAME, dev->name, total_len);
@@ -514,6 +506,7 @@
          write_4bits(dev, low_nibble);
          toggle_ctrl_clock(dev);
      }
+     
      
      // 6. EOT 신호 전송 (느린 클럭 + 데이터핀 모두 High)
      pr_debug("[%s] %s: Sending EOT signal\n", DRIVER_NAME, dev->name);
