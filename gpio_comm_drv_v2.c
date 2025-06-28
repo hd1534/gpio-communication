@@ -137,7 +137,7 @@
  // 4. 프로토타입 선언
  // =================================================================
  
- static void release_all_resources(struct gpio_comm_dev *dev);
+ static int release_all_resources(struct gpio_comm_dev *dev);
  
 
  
@@ -151,7 +151,7 @@
          pr_err("[%s] ERROR: write_4bits: NULL device pointer\n", DRIVER_NAME);
          return;
      }
-     pr_debug("[%s] write_4bits: Writing data: 0x%02X\n", DRIVER_NAME, data);
+     pr_debug("[%s] %s: write_4bits: Writing data: 0x%02X\n", DRIVER_NAME, dev->name, data);
      gpiod_set_value_cansleep(dev->data_pins[0], data & 0x01);
      gpiod_set_value_cansleep(dev->data_pins[1], (data >> 1) & 0x01);
      gpiod_set_value_cansleep(dev->data_pins[2], (data >> 2) & 0x01);
@@ -169,7 +169,7 @@
      data |= (gpiod_get_value_cansleep(dev->data_pins[1]) & 0x01) << 1;
      data |= (gpiod_get_value_cansleep(dev->data_pins[2]) & 0x01) << 2;
      data |= (gpiod_get_value_cansleep(dev->data_pins[3]) & 0x01) << 3;
-     pr_debug("[%s] read_4bits: Read data: 0x%02X\n", DRIVER_NAME, data);
+     pr_debug("[%s] %s: read_4bits: Read data: 0x%02X\n", DRIVER_NAME, dev->name, data);
      return data;
  }
  
@@ -313,7 +313,7 @@
   */
  static irqreturn_t data_pin_irq_handler(int irq, void *dev_id) {
      if (!dev_id) {
-         pr_err("[%s] %s: ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME, dev->name);
+         pr_err("[%s]: ERROR: data_pin_irq_handler: dev_id is NULL\n", DRIVER_NAME);
          return IRQ_NONE;
      }
      struct gpio_comm_dev *dev = (struct gpio_comm_dev *)dev_id;
@@ -737,11 +737,11 @@
   * @brief 디바이스와 관련된 모든 할당된 자원을 해제.
   * @note unexport 시 또는 모듈 종료 시 호출됨.
   */
- static void release_all_resources(struct gpio_comm_dev *dev) {
+ static int release_all_resources(struct gpio_comm_dev *dev) {
      int i, bcm;
      if (!dev) {
          pr_err("[%s] ERROR: release_all_resources called with NULL device\n", DRIVER_NAME);
-         return;
+         return -EINVAL;
      }
      pr_info("[%s] Releasing all resources for device %s (%p)\n", 
              DRIVER_NAME, dev->name, dev);
@@ -788,6 +788,7 @@
      pr_debug("[%s] %s: Releasing memory\n", DRIVER_NAME, dev->name); 
      kfree(dev->rx_buffer);
      kfree(dev);
+     return 0;
  }
  
  /**
@@ -988,7 +989,7 @@
          return -EINVAL;
      }
      char name[MAX_NAME_LEN];
-     int i;
+     int i, ret;
      struct gpio_comm_dev *dev = NULL;
  
      sscanf(buf, "%19s", name);
@@ -1004,7 +1005,12 @@
      mutex_unlock(&g_dev_lock);
  
      if (dev) {
-         release_all_resources(dev); // 찾은 디바이스의 모든 자원 해제
+         // 찾은 디바이스의 모든 자원 해제
+         ret = release_all_resources(dev);
+         if (ret != 0) {
+            pr_err("[%s] Device '%s' failed to remove.\n", DRIVER_NAME, name);
+            return ret;
+         }
          pr_info("[%s] Device '%s' removed.\n", DRIVER_NAME, name);
      } else {
          return -ENOENT; // 해당 이름의 디바이스 없음
@@ -1051,7 +1057,7 @@
  }
  
  static void __exit gpio_comm_exit(void) {
-     int i;
+     int i, ret;
  
      // 모든 생성된 디바이스의 리소스를 해제
      for (i = 0; i < MAX_DEVICES; i++) {
@@ -1060,7 +1066,9 @@
              struct gpio_comm_dev* dev_to_free = g_dev_table[i];
              g_dev_table[i] = NULL;
              mutex_unlock(&g_dev_lock);
-             release_all_resources(dev_to_free);
+             if (release_all_resources(dev_to_free)) {
+                pr_err("[%s] Device '%s' failed to remove.\n", DRIVER_NAME, dev_to_free->name);
+             }
          }
      }
      
