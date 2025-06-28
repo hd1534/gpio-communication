@@ -59,8 +59,8 @@
  #define GPIOCHIP_BASE 512
 
  // Start Of Transmission, End Of Transmission 니블 정의
- #define SOT_NIBBLE 0x0F
- #define EOT_NIBBLE 0x0F
+ #define SOT_NIBBLE 0b1111
+ #define EOT_NIBBLE 0b1010
 
 
  // =================================================================
@@ -356,12 +356,6 @@
      if (dev->my_pin_idx != -1) {
          gpiod_direction_input(dev->data_pins[dev->my_pin_idx]);
      }
-     
-     // 3. 수신 준비: 버퍼/카운터 리셋
-     dev->last_irq_time = ktime_get();
-     atomic_set(&dev->rx_bytes_done, 0);
-     atomic_set(&dev->rx_bits_done, 0);
-     atomic_set(&dev->data_ready, 0);
  
      // 4. IRQ 전환: 다른 데이터 핀의 요청은 더 이상 받을 필요 없으므로 비활성화하고,
      //             제어 핀의 클럭을 감지하도록 제어 핀 IRQ를 활성화.
@@ -479,8 +473,10 @@
      pr_debug("[%s] %s: TX buffer allocated at %p\n",
               DRIVER_NAME, dev->name, tx_buf);
 
-     // 제어 핀 IRQ 비활성화
-     disable_irq_nosync(dev->irqs[0]);
+     // 핀 IRQ 비활성화
+     for (i = 0; i < NUM_DATA_PINS+1; i++) {
+        disable_irq_nosync(dev->irqs[i]);
+     }
  
      // 1. 버스 상태 확인 및 점유 시작 (경쟁 상태 방지)
      spin_lock_irqsave(&dev->lock, flags);
@@ -593,6 +589,7 @@
      gpiod_set_value_cansleep(dev->ctrl_pin, 1);
      usleep_range(CLOCK_DELAY_US * 3, CLOCK_DELAY_US * 3 + 100);
      gpiod_set_value_cansleep(dev->ctrl_pin, 0);
+     write_4bits(dev, 0x00);
      
      ret = count; // 성공 시 실제 데이터 길이 반환
  
@@ -601,8 +598,12 @@
      gpiod_direction_input(dev->ctrl_pin);
      for(i=0; i<NUM_DATA_PINS; i++) gpiod_direction_input(dev->data_pins[i]); // 모든 핀을 다시 입력으로
      gpiod_direction_output(dev->data_pins[dev->my_pin_idx], 1); // 내 핀은 다시 출력(High) 상태로 복원
-     for (i = 0; i < NUM_DATA_PINS; i++) if (dev->irqs[i+1] > 0) enable_irq(dev->irqs[i+1]); // 데이터핀 IRQ 다시 활성화
  
+     // 핀 IRQ 활성화
+     for (i = 0; i < NUM_DATA_PINS+1; i++) {
+        enable_irq(dev->irqs[i]);
+     }
+     
  tx_abort:
      // 8. 최종 상태 복원 및 자원 해제
      spin_lock_irqsave(&dev->lock, flags);
@@ -615,8 +616,6 @@
      pr_debug("[%s] %s: gpio_comm_write: Exit. Wrote %zu bytes\n",
               DRIVER_NAME, dev->name, count);
 
-     // 제어 핀 IRQ 활성화
-     enable_irq(dev->irqs[0]);
      
      return count;
  }
@@ -646,37 +645,38 @@
      pr_debug("[%s] %s: gpio_comm_read: dev=%p, len=%zu, state=%d, data_ready=%d\n", 
               DRIVER_NAME, dev->name, dev, len, dev->state, atomic_read(&dev->data_ready));
  
-     // 1. 데이터가 준비될 때까지 대기
-     // 이미 처리할 데이터가 있는지 먼저 확인.
-     if (atomic_read(&dev->data_ready) == 0) {
-         pr_debug("[%s] %s: No data ready, waiting... (current state: %d)\n",
-                 DRIVER_NAME, dev->name, dev->state);
-                 
-         // 읽기 대기 전, 수신 모드로 확실히 전환. (R/O 모드의 경우 항상 수신 대기)
-         spin_lock_irqsave(&dev->lock, flags);
-         if (dev->state == COMM_STATE_IDLE) {
-             dev->state = COMM_STATE_WAIT_SOT;
-             pr_debug("[%s] %s: Changed state to WAIT_SOT\n", DRIVER_NAME, dev->name);
-             // R/O 모드는 항상 ctrl irq 활성화 필요. RW모드는 data_pin_irq_handler에서 처리.
-             if (dev->mode == MODE_READ_ONLY) {
-                 pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", DRIVER_NAME, dev->name);
-                 enable_irq(dev->irqs[0]);
-             }
-         } else {
-             pr_err("[%s] %s: Device is not idle, rejected. current state: %d.\n", DRIVER_NAME, dev->name, dev->state);
-             return -EBUSY;
-         }
-         spin_unlock_irqrestore(&dev->lock, flags);
-         
-         // data_ready 플래그가 0이 아닐 때까지 대기 큐에서 잠듦.
-         // 인터럽트로 깨어날 수 있음 (-ERESTARTSYS).
-         pr_debug("[%s] %s: Waiting for data (current data_ready=%d)...\n", DRIVER_NAME, dev->name, atomic_read(&dev->data_ready));
-         ret = wait_event_interruptible(dev->wq, atomic_read(&dev->data_ready) != 0);
-         if (ret) {
-             pr_debug("[%s] %s: Read wait interrupted by signal (ret=%d)\n", DRIVER_NAME, dev->name, ret);
-             return -ERESTARTSYS;
-         }
-     }
+    if (atomic_read(&dev->data_ready) != 0) {
+        // clean up: 버퍼/카운터 리셋
+        dev->last_irq_time = ktime_get();
+        atomic_set(&dev->rx_bytes_done, 0);
+        atomic_set(&dev->rx_bits_done, 0);
+        atomic_set(&dev->data_ready, 0);
+    }
+    
+    // 읽기 대기 전, 수신 모드로 확실히 전환. (R/O 모드의 경우 항상 수신 대기)
+    spin_lock_irqsave(&dev->lock, flags);
+    if (dev->state == COMM_STATE_IDLE) {
+        dev->state = COMM_STATE_WAIT_SOT;
+        pr_debug("[%s] %s: Changed state to WAIT_SOT\n", DRIVER_NAME, dev->name);
+        // R/O 모드는 항상 ctrl irq 활성화 필요. RW모드는 data_pin_irq_handler에서 처리.
+        if (dev->mode == MODE_READ_ONLY) {
+            pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", DRIVER_NAME, dev->name);
+            enable_irq(dev->irqs[0]);
+        }
+    } else {
+        pr_err("[%s] %s: Device is not idle, rejected. current state: %d.\n", DRIVER_NAME, dev->name, dev->state);
+        return -EBUSY;
+    }
+    spin_unlock_irqrestore(&dev->lock, flags);
+    
+    // data_ready 플래그가 0이 아닐 때까지 대기 큐에서 잠듦.
+    // 인터럽트로 깨어날 수 있음 (-ERESTARTSYS).
+    pr_debug("[%s] %s: Waiting for data (current data_ready=%d)...\n", DRIVER_NAME, dev->name, atomic_read(&dev->data_ready));
+    ret = wait_event_interruptible(dev->wq, atomic_read(&dev->data_ready) != 0);
+    if (ret) {
+        pr_debug("[%s] %s: Read wait interrupted by signal (ret=%d)\n", DRIVER_NAME, dev->name, ret);
+        return -ERESTARTSYS;
+    }
      
      // 2. 수신 결과 확인
      ret = atomic_read(&dev->data_ready);
