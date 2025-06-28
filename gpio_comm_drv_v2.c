@@ -406,6 +406,9 @@
                  DRIVER_NAME, dev->name, dev->state);
          dev->state = COMM_STATE_IDLE;
      }
+     // 모든 핀을 입력으로 전환 (충돌 방지?)
+     gpiod_direction_input(dev->ctrl_pin);
+     for(int i=0; i<NUM_DATA_PINS; i++) gpiod_direction_input(dev->data_pins[i]);
      spin_unlock_irq(&dev->lock);
      
      return 0;
@@ -459,6 +462,9 @@
      }
      pr_debug("[%s] %s: TX buffer allocated at %p\n",
               DRIVER_NAME, dev->name, tx_buf);
+
+     // 제어 핀 IRQ 비활성화
+     disable_irq_nosync(dev->irqs[0]);
  
      // 1. 버스 상태 확인 및 점유 시작 (경쟁 상태 방지)
      spin_lock_irqsave(&dev->lock, flags);
@@ -560,10 +566,13 @@
      }
      
      // 6. EOT 신호 전송 (느린 클럭 + 데이터핀 모두 High)
+     pr_debug("[%s] %s: Sending EOT signal\n", DRIVER_NAME, dev->name);
      write_4bits(dev, 0x0F);
      gpiod_set_value_cansleep(dev->ctrl_pin, 0);
      usleep_range(CLOCK_DELAY_US * 3, CLOCK_DELAY_US * 3 + 100);
      gpiod_set_value_cansleep(dev->ctrl_pin, 1);
+     usleep_range(CLOCK_DELAY_US * 3, CLOCK_DELAY_US * 3 + 100);
+     gpiod_set_value_cansleep(dev->ctrl_pin, 0);
      
      ret = count; // 성공 시 실제 데이터 길이 반환
  
@@ -585,6 +594,10 @@
      
      pr_debug("[%s] %s: gpio_comm_write: Exit. Wrote %zu bytes\n",
               DRIVER_NAME, dev->name, count);
+
+     // 제어 핀 IRQ 활성화
+     enable_irq(dev->irqs[0]);
+     
      return count;
  }
  
