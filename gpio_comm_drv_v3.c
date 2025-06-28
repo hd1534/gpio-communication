@@ -577,16 +577,12 @@
      u16 calc_crc, rx_crc;
      unsigned long flags;
      
-     pr_debug("[%s] %s: gpio_comm_read: dev=%p, len=%zu, state=%d, data_ready=%d\n", 
-              DRIVER_NAME, dev->name, dev, len, dev->state, atomic_read(&dev->data_ready));
- 
-    if (atomic_read(&dev->data_ready) != 0) {
-        // clean up: 버퍼/카운터 리셋
-        dev->last_irq_time = ktime_get();
-        atomic_set(&dev->rx_bytes_done, 0);
-        atomic_set(&dev->rx_bits_done, 0);
-        atomic_set(&dev->data_ready, 0);
-    }
+    // clean up: 버퍼/카운터 리셋
+    pr_debug("[%s] %s: gpio_comm_read: clean up\n", DRIVER_NAME, dev->name);
+    dev->last_irq_time = ktime_get();
+    atomic_set(&dev->rx_bytes_done, 0);
+    atomic_set(&dev->rx_bits_done, 0);
+    atomic_set(&dev->data_ready, 0);
     
     // idle 상태가 아니면 read 요청 거부.
     spin_lock_irqsave(&dev->lock, flags);
