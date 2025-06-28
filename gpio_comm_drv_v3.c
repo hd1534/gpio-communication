@@ -382,8 +382,8 @@
      }
      
      struct gpio_comm_dev *dev = filp->private_data;
-     pr_debug("[%s] %s: gpio_comm_write: dev=%p, count=%zu, mode=%d, current state=%d\n", 
-              DRIVER_NAME, dev->name, dev, count, dev->mode, dev->state);
+     pr_debug("[%s] %s: gpio_comm_write: dev=%p, count=%zu, my_pin_idx=%d, current state=%d\n", 
+              DRIVER_NAME, dev->name, dev, count, dev->my_pin_idx, dev->state);
      
      u8 *tx_buf = NULL;
      int i, ret = 0;
@@ -395,8 +395,8 @@
               DRIVER_NAME, dev->name, total_len, count);
  
      // mypin이 -1이면 쓰기 불가
-     if (dev->mypin == -1) {
-         pr_err("[%s] %s: Write attempted without mypin (mypin=%d)\n", DRIVER_NAME, dev->name, dev->mypin);
+     if (dev->my_pin_idx == -1) {
+         pr_err("[%s] %s: Write attempted without mypin (mypin=%d)\n", DRIVER_NAME, dev->name, dev->my_pin_idx);
          return -EPERM;
      }
 
@@ -507,7 +507,7 @@
          toggle_ctrl_clock(dev);
      }
      
-     
+
      // 6. EOT 신호 전송 (느린 클럭 + 데이터핀 모두 High)
      pr_debug("[%s] %s: Sending EOT signal\n", DRIVER_NAME, dev->name);
      write_4bits(dev, EOT_NIBBLE);
@@ -576,20 +576,20 @@
         atomic_set(&dev->data_ready, 0);
     }
     
-    // 읽기 대기 전, 수신 모드로 확실히 전환. (R/O 모드의 경우 항상 수신 대기)
+    // idle 상태가 아니면 read 요청 거부.
     spin_lock_irqsave(&dev->lock, flags);
-    if (dev->state == COMM_STATE_IDLE) {
-        dev->state = COMM_STATE_WAIT_SOT;
-        pr_debug("[%s] %s: Changed state to WAIT_SOT\n", DRIVER_NAME, dev->name);
-        // R/O 모드는 항상 ctrl irq 활성화 필요. RW모드는 data_pin_irq_handler에서 처리.
-        if (dev->mode == MODE_READ_ONLY) {
-            pr_debug("[%s] %s: Enabling control IRQ (R/O mode)\n", DRIVER_NAME, dev->name);
-            enable_irq(dev->ctrl_irq);
-        }
-    } else {
+    if (dev->state != COMM_STATE_IDLE) {
         pr_err("[%s] %s: Device is not idle, rejected. current state: %d.\n", DRIVER_NAME, dev->name, dev->state);
         return -EBUSY;
     }
+
+    // idle 상태에서 수신 대기 상태로 전환.
+    dev->state = COMM_STATE_WAIT_SOT;
+    pr_debug("[%s] %s: Changed state to WAIT_SOT\n", DRIVER_NAME, dev->name);
+
+    // control irq 활성화.
+    enable_irq(dev->ctrl_irq);
+    pr_debug("[%s] %s: Enabling control IRQ\n", DRIVER_NAME, dev->name);
     spin_unlock_irqrestore(&dev->lock, flags);
     
     // data_ready 플래그가 0이 아닐 때까지 대기 큐에서 잠듦.
@@ -600,13 +600,20 @@
         pr_debug("[%s] %s: Read wait interrupted by signal (ret=%d)\n", DRIVER_NAME, dev->name, ret);
         return -ERESTARTSYS;
     }
+
+    // control irq 비활성화.
+    pr_debug("[%s] %s: Disabling control IRQ\n", DRIVER_NAME, dev->name);
+    spin_lock_irqsave(&dev->lock, flags);
+    disable_irq_nosync(dev->ctrl_irq);
+    spin_unlock_irqrestore(&dev->lock, flags);
+    
      
-     // 2. 수신 결과 확인
-     ret = atomic_read(&dev->data_ready);
-     pr_debug("[%s] %s: Data ready with status: %d\n", 
-             DRIVER_NAME, dev->name, ret);
-             
-     atomic_set(&dev->data_ready, 0); // 플래그를 다시 0으로 리셋 (다음 read를 위해)
+    // 2. 수신 결과 확인
+    ret = atomic_read(&dev->data_ready);
+    pr_debug("[%s] %s: Data ready with status: %d\n", 
+            DRIVER_NAME, dev->name, ret);
+            
+    atomic_set(&dev->data_ready, 0); // 플래그를 다시 0으로 리셋 (다음 read를 위해)
      
      if (ret < 0) {
          pr_err("[%s] %s: Read error occurred: %d\n", 
@@ -651,12 +658,7 @@
      // 4. 유저 공간으로 데이터 복사
      if (len < bytes_to_copy) bytes_to_copy = len; // 사용자가 요청한 길이가 더 작으면 그만큼만 복사
      if (copy_to_user(buf, dev->rx_buffer + 2, bytes_to_copy)) return -EFAULT;
-     
-     // 5. 버스 상태 복원
-     spin_lock_irqsave(&dev->lock, flags);
-     disable_irq_nosync(dev->ctrl_irq); // 제어핀 IRQ는 일단 비활성화
      dev->state = COMM_STATE_IDLE; // 유휴 상태로 전환
-     spin_unlock_irqrestore(&dev->lock, flags);
 
      pr_debug("[%s] %s: Read complete, set state to IDLE, returning %d bytes\n", DRIVER_NAME, dev->name, bytes_to_copy);
      return bytes_to_copy; // 복사한 바이트 수 반환
@@ -1005,5 +1007,5 @@
  // 모듈 정보
  MODULE_LICENSE("GPL");
  MODULE_AUTHOR("HJH & Gemini");
- MODULE_DESCRIPTION("P2P GPIO Comm Driver v2.3");
+ MODULE_DESCRIPTION("P2P GPIO Comm Driver v3.0");
  

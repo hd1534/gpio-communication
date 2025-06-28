@@ -1,10 +1,10 @@
 /**
  * @file sender.c
  * @brief gpio_comm_drv를 위한 송신 테스트 프로그램
- * @version 1.0
+ * @version 2.0
  *
  * @note
- * - 이 프로그램은 지정된 gpio_comm 디바이스를 읽기/쓰기('rw') 모드로 엽니다.
+ * - 이 프로그램은 지정된 gpio_comm 디바이스를 읽기/쓰기(mypin=1) 모드로 엽니다.
  * - 사용자로부터 문자열을 입력받아 `write()` 시스템 콜을 통해 드라이버로 전송합니다.
  * - 컴파일: gcc -Wall -o sender sender.c
  * - 실행 전 확인:

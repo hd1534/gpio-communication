@@ -1,10 +1,10 @@
 /**
  * @file listener.c
  * @brief gpio_comm_drv를 위한 수신 전용 테스트 프로그램
- * @version 1.0
+ * @version 2.0
  *
  * @note
- * - 이 프로그램은 지정된 gpio_comm 디바이스를 읽기 전용('r') 모드로 엽니다.
+ * - 이 프로그램은 지정된 gpio_comm 디바이스를 읽기 전용(mypin=-1) 모드로 엽니다.
  * - 드라이버로부터 완전한 데이터 패킷이 수신될 때까지 대기(block)합니다.
  * - 수신된 데이터를 표준 출력(stdout)에 출력합니다.
  * - 컴파일: gcc -Wall -o listener listener.c
